@@ -570,11 +570,22 @@ impl<'a> Iterator for SubchainAtomIndexedIter<'a> {
 /// Atoms in the same raw run share their chain identifier, their hetatm flag,
 /// and — for non-polymer atoms — their residue name. Bond-graph merging on
 /// top of this predicate is handled by [`SubchainPartition::from_molecule`].
+///
+/// Biopolymer atoms (protein or nucleic, by classification flags) on the
+/// same chain are always kept together regardless of the raw `hetatm`
+/// record bit: a modified residue that's chemically part of a polymer
+/// strand but recorded as `HETATM` (e.g. a modified nucleotide) must not
+/// split the strand into separate subchains just because of how the
+/// source file recorded that one residue.
 #[inline]
 pub fn atoms_same_subchain(a: &Atom, b: &Atom) -> bool {
-    a.residue.chain == b.residue.chain
-        && a.state.hetatm == b.state.hetatm
-        && (!a.state.hetatm || a.residue.resn == b.residue.resn)
+    if a.residue.chain != b.residue.chain {
+        return false;
+    }
+    if a.state.flags.is_biomolecule() && b.state.flags.is_biomolecule() {
+        return true;
+    }
+    a.state.hetatm == b.state.hetatm && (!a.state.hetatm || a.residue.resn == b.residue.resn)
 }
 
 // ============================================================================
@@ -1562,5 +1573,101 @@ mod tests {
         // Add a bond — invalidation should kick in via add_bond.
         link(&mut mol, a[1], b[0]);
         assert_eq!(mol.subchain_partition().entries().len(), 1);
+    }
+
+    #[test]
+    fn polymer_subchains_not_broken_by_interior_hetatm_nucleotide() {
+        // DA-DC-<modified nucleotide, NUCLEIC-flagged but recorded as
+        // HETATM>-DG-DT: a modified base (e.g. a methylated/oxidized
+        // cytosine) chemically part of the strand, but recorded with the
+        // HETATM record type as depositors commonly do. The cartoon path's
+        // polymer_subchains() must see this as ONE 5-residue biopolymer
+        // subchain, not three pieces split around the interior residue.
+        let mut mol = ObjectMolecule::new("modified-nucleotide-chain");
+        add_residue_atoms(
+            &mut mol,
+            "Z",
+            "DA",
+            1,
+            &["P", "C1'"],
+            AtomFlags::NUCLEIC | AtomFlags::POLYMER,
+            false,
+        );
+        add_residue_atoms(
+            &mut mol,
+            "Z",
+            "DC",
+            2,
+            &["P", "C1'"],
+            AtomFlags::NUCLEIC | AtomFlags::POLYMER,
+            false,
+        );
+        add_residue_atoms(
+            &mut mol,
+            "Z",
+            "5CM",
+            3,
+            &["P", "C1'"],
+            AtomFlags::NUCLEIC | AtomFlags::POLYMER,
+            true,
+        );
+        add_residue_atoms(
+            &mut mol,
+            "Z",
+            "DG",
+            4,
+            &["P", "C1'"],
+            AtomFlags::NUCLEIC | AtomFlags::POLYMER,
+            false,
+        );
+        add_residue_atoms(
+            &mut mol,
+            "Z",
+            "DT",
+            5,
+            &["P", "C1'"],
+            AtomFlags::NUCLEIC | AtomFlags::POLYMER,
+            false,
+        );
+
+        let chain = mol.chains().next().expect("one chain");
+        let subchains: Vec<_> = chain.polymer_subchains().collect();
+        assert_eq!(
+            subchains.len(),
+            1,
+            "expected one contiguous polymer subchain, got {}",
+            subchains.len()
+        );
+        assert_eq!(subchains[0].len(), 10, "5 residues x 2 atoms each");
+    }
+
+    #[test]
+    fn partition_does_not_absorb_polymer_still_holds_with_new_predicate() {
+        // Guard against a regression where the biopolymer fast-path in
+        // atoms_same_subchain accidentally widens to non-biopolymer atoms:
+        // an ORGANIC-flagged HET residue adjacent to a biopolymer residue on
+        // the same chain must still split into separate subchains.
+        let mut mol = ObjectMolecule::new("asn-nag-still-splits");
+        add_residue_atoms(
+            &mut mol,
+            "A",
+            "ASN",
+            1,
+            &["N", "CA", "C", "O", "ND2"],
+            AtomFlags::PROTEIN | AtomFlags::POLYMER,
+            false,
+        );
+        add_residue_atoms(
+            &mut mol,
+            "A",
+            "NAG",
+            2,
+            &["C1", "C2"],
+            AtomFlags::ORGANIC,
+            true,
+        );
+        let chain = mol.chains().next().expect("one chain");
+        let subchains: Vec<_> = chain.subchains().collect();
+        assert_eq!(subchains.len(), 2);
     }
 }
