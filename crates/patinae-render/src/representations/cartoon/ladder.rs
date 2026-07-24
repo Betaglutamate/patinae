@@ -20,7 +20,7 @@
 //! automatically show/hide alongside the cartoon representation with no
 //! separate "show" plumbing needed.
 
-use patinae_mol::{CoordSet, DirtyFlags, ObjectMolecule};
+use patinae_mol::{CoordSet, DirtyFlags, ObjectMolecule, RepMask};
 use patinae_settings::ResolvedSettings;
 
 use crate::picking::RepKind;
@@ -63,6 +63,14 @@ impl NucleicLadderRep {
 /// Resolve detected base pairs to their `C1'` world positions, as plain
 /// tuples `(atom_a, atom_b, pos_a, pos_b)` -- device-free so it's directly
 /// unit-testable (see [`tests::resolves_one_pair_with_matching_positions`]).
+///
+/// A pair is dropped unless *both* `C1'` atoms currently have the cartoon
+/// representation visible (`repr.visible_reps` -- the same per-atom bit
+/// `cartoon.wgsl`'s fragment shader checks via `scene_atom_in_rep` to
+/// discard hidden cartoon pixels). Rungs are drawn through the stick
+/// pipeline directly, bypassing both that shader and the stick
+/// compute-build's own bond/atom visibility filtering, so without this
+/// check they'd ignore "hide cartoon" entirely.
 fn resolve_pairs(
     molecule: &ObjectMolecule,
     coord_set: &CoordSet,
@@ -70,6 +78,13 @@ fn resolve_pairs(
     detect_base_pairs(molecule, coord_set)
         .iter()
         .filter_map(|p| {
+            let atom_a = molecule.get_atom(p.c1_a)?;
+            let atom_b = molecule.get_atom(p.c1_b)?;
+            if !atom_a.repr.visible_reps.is_visible(RepMask::CARTOON)
+                || !atom_b.repr.visible_reps.is_visible(RepMask::CARTOON)
+            {
+                return None;
+            }
             let pa = coord_set.get_atom_coord(p.c1_a)?;
             let pb = coord_set.get_atom_coord(p.c1_b)?;
             Some((
@@ -120,7 +135,7 @@ impl Representation for NucleicLadderRep {
         &mut self,
         input: &RenderObjectInput,
         settings: &ResolvedSettings,
-        dirty: DirtyFlags,
+        _dirty: DirtyFlags,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) {
@@ -132,17 +147,14 @@ impl Representation for NucleicLadderRep {
             return;
         }
 
-        // Same "only LUT/draw bits dirty" fast path CartoonRep uses --
-        // rung geometry doesn't depend on color/visibility either.
-        let lut_only = dirty.is_lut_only()
-            || (!dirty.is_empty()
-                && dirty
-                    .difference(DirtyFlags::LUT_ONLY_MASK.union(DirtyFlags::DRAW_MASK))
-                    .is_empty());
-        if lut_only && self.instance_buf.is_some() {
-            return;
-        }
-
+        // Unlike CartoonRep, rung visibility is baked into `resolved` at
+        // build time (see `resolve_pairs`'s per-atom CARTOON check) rather
+        // than gated later in a fragment shader -- so, unintuitively,
+        // `DirtyFlags::VISIBILITY` (part of CartoonRep's `LUT_ONLY_MASK`
+        // fast path) *must* trigger a real rebuild here, or `hide cartoon`
+        // would leave stale rungs on screen. No fast path: just recompute
+        // and rely on `hash_pairs`/`last_signature` below to skip the
+        // upload when nothing relevant actually changed.
         let resolved = resolve_pairs(input.molecule, input.coord_set);
         let sig = hash_pairs(&resolved);
         if self.last_signature == Some(sig) {
@@ -243,16 +255,23 @@ mod tests {
         c1: [f32; 3],
         wc_name: &str,
         wc: [f32; 3],
+        cartoon_visible: bool,
     ) -> MoleculeBuilder {
         let res = Arc::new(AtomResidue::from_parts(chain, resn, resv, ' ', ""));
         let mut c1_atom = AtomBuilder::new().name("C1'").element_symbol("C").build();
         c1_atom.residue = res.clone();
         c1_atom.state.flags |= AtomFlags::NUCLEIC | AtomFlags::POLYMER;
+        if cartoon_visible {
+            c1_atom.repr.visible_reps.set_visible(RepMask::CARTOON);
+        }
         b = b.add_atom(c1_atom, lin_alg::f32::Vec3::new(c1[0], c1[1], c1[2]));
 
         let mut wc_atom = AtomBuilder::new().name(wc_name).element_symbol("N").build();
         wc_atom.residue = res;
         wc_atom.state.flags |= AtomFlags::NUCLEIC | AtomFlags::POLYMER;
+        if cartoon_visible {
+            wc_atom.repr.visible_reps.set_visible(RepMask::CARTOON);
+        }
         b.add_atom(wc_atom, lin_alg::f32::Vec3::new(wc[0], wc[1], wc[2]))
     }
 
@@ -260,6 +279,10 @@ mod tests {
     /// `basepair::tests` -- a known, hand-verified Watson-Crick pair (real
     /// coordinates from PyMOL's `fnab`, not hand-waved).
     fn one_pair_molecule() -> ObjectMolecule {
+        one_pair_molecule_with_visibility(true, true)
+    }
+
+    fn one_pair_molecule_with_visibility(a_visible: bool, b_visible: bool) -> ObjectMolecule {
         let b = MoleculeBuilder::new("pair");
         let b = add_residue(
             b,
@@ -269,6 +292,7 @@ mod tests {
             [1.256415, 5.500146, -0.007610],
             "N1",
             [-0.498585, 0.670146, -0.007610],
+            a_visible,
         );
         let b = add_residue(
             b,
@@ -278,6 +302,7 @@ mod tests {
             [1.256415, -5.187853, -0.039610],
             "N3",
             [-0.882585, -2.182853, 0.099390],
+            b_visible,
         );
         b.build()
     }
@@ -314,5 +339,25 @@ mod tests {
     fn no_pairs_yields_no_instances() {
         let resolved: Vec<(u32, u32, [f32; 3], [f32; 3])> = Vec::new();
         assert!(rung_instances_from_pairs(&resolved).is_empty());
+    }
+
+    #[test]
+    fn pair_dropped_when_cartoon_hidden_for_either_side() {
+        // Regression test: rungs are drawn through the stick pipeline
+        // directly, bypassing both cartoon.wgsl's per-atom `discard` and
+        // the stick compute-build's own visibility filtering, so without
+        // resolve_pairs' explicit CARTOON check, `hide cartoon` would
+        // leave stale rungs on screen.
+        let both_hidden = one_pair_molecule_with_visibility(false, false);
+        let coord = both_hidden.current_coord_set().expect("coord set").clone();
+        assert!(resolve_pairs(&both_hidden, &coord).is_empty());
+
+        let one_hidden = one_pair_molecule_with_visibility(true, false);
+        let coord = one_hidden.current_coord_set().expect("coord set").clone();
+        assert!(resolve_pairs(&one_hidden, &coord).is_empty());
+
+        let both_visible = one_pair_molecule_with_visibility(true, true);
+        let coord = both_visible.current_coord_set().expect("coord set").clone();
+        assert_eq!(resolve_pairs(&both_visible, &coord).len(), 1);
     }
 }
