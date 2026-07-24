@@ -1,9 +1,12 @@
-//! Nucleic acid base-pair "rung" rendering.
-//!
-//! Turns [`super::basepair::detect_base_pairs`]'s output into actual
-//! geometry: one capsule per detected base pair, connecting the two
-//! strands' `C1'` atoms (the canonical "ladder" look of a double-helix
-//! cartoon).
+//! Nucleic acid base rendering: the real sugar-phosphate backbone is
+//! already drawn by `CartoonType::NucleicRect` (see `tessellation.rs`);
+//! this fills in the base rings using the molecule's own atoms and real
+//! covalent bonds, the same way `sticks` renders anything else. There is
+//! no synthetic "this residue pairs with that one" step -- a real
+//! Watson-Crick duplex places paired bases right next to each other in
+//! space, so drawing every base's actual ring geometry at its actual
+//! position already produces the classic ladder look. This matches how
+//! PyMOL does it: the "rungs" are real atoms, not an invented connector.
 //!
 //! This is its own [`RepKind::NucleicLadder`], not extra geometry bolted
 //! onto [`super::CartoonRep`]'s own draw calls -- reusing the cartoon
@@ -16,23 +19,118 @@
 //! pipeline correctly on its own.
 //!
 //! Shares [`RepMask::CARTOON`] with `RepKind::Cartoon`/`Ribbon` (see the
-//! catalog entry in `representations/catalog.rs`), so rungs
-//! automatically show/hide alongside the cartoon representation with no
-//! separate "show" plumbing needed.
+//! catalog entry in `representations/catalog.rs`), so bases automatically
+//! show/hide alongside the cartoon representation with no separate "show"
+//! plumbing needed.
 
-use patinae_mol::{CoordSet, DirtyFlags, ObjectMolecule, RepMask};
+use patinae_mol::{AtomFlags, CoordSet, DirtyFlags, ObjectMolecule, RepMask};
 use patinae_settings::ResolvedSettings;
 
 use crate::picking::RepKind;
 use crate::pipelines::stick::{StickParams, StickParamsLayout};
 use crate::render_input::RenderObjectInput;
-use crate::representations::cartoon::basepair::detect_base_pairs;
 use crate::representations::stick::StickInstance;
 use crate::representations::{BuildCtx, Representation};
 
-/// Capsule radius for rungs -- thinner than the default stick radius
-/// (0.25), since a rung is an accent, not a bond.
-const RUNG_RADIUS: f32 = 0.2;
+/// Capsule radius for base sticks -- thinner than the default stick
+/// radius (0.25), to read as an accent on the cartoon rather than a
+/// full atomic-detail stick rendering.
+const BASE_STICK_RADIUS: f32 = 0.15;
+
+/// Standard sugar-phosphate backbone atom names (DNA and RNA). Anything
+/// else on a `NUCLEIC`-flagged atom is part of the base. Deliberately a
+/// small, chemistry-agnostic exclusion list rather than an enumeration
+/// of base-ring atom names, so modified/methylated bases (5mC, 5hmC,
+/// 5fC, ...) work the same as standard ones with no extra cases needed.
+fn is_nucleic_backbone_atom_name(name: &str) -> bool {
+    matches!(
+        name,
+        "P" | "OP1"
+            | "OP2"
+            | "OP3"
+            | "O1P"
+            | "O2P"
+            | "O3P"
+            | "O5'"
+            | "C5'"
+            | "C4'"
+            | "O4'"
+            | "C3'"
+            | "O3'"
+            | "C2'"
+            | "O2'"
+            | "C1'"
+    )
+}
+
+/// Resolve real bonds worth drawing as base sticks: both atoms nucleic,
+/// not a pure backbone-backbone bond (the ribbon already represents
+/// that), and both currently cartoon-visible (see the module docs on
+/// `RepMask::CARTOON` sharing -- the stick pipeline reused here has no
+/// per-atom visibility gate of its own, so it must be applied here).
+/// Device-free so it's directly unit-testable.
+fn resolve_base_bonds(
+    molecule: &ObjectMolecule,
+    coord_set: &CoordSet,
+) -> Vec<(u32, u32, [f32; 3], [f32; 3])> {
+    molecule
+        .bonds()
+        .filter_map(|bond| {
+            let a = molecule.get_atom(bond.atom1)?;
+            let b = molecule.get_atom(bond.atom2)?;
+            if !a.state.flags.contains(AtomFlags::NUCLEIC)
+                || !b.state.flags.contains(AtomFlags::NUCLEIC)
+            {
+                return None;
+            }
+            if is_nucleic_backbone_atom_name(&a.name) && is_nucleic_backbone_atom_name(&b.name) {
+                return None;
+            }
+            if !a.repr.visible_reps.is_visible(RepMask::CARTOON)
+                || !b.repr.visible_reps.is_visible(RepMask::CARTOON)
+            {
+                return None;
+            }
+            let pa = coord_set.get_atom_coord(bond.atom1)?;
+            let pb = coord_set.get_atom_coord(bond.atom2)?;
+            Some((
+                bond.atom1.as_u32(),
+                bond.atom2.as_u32(),
+                [pa.x, pa.y, pa.z],
+                [pb.x, pb.y, pb.z],
+            ))
+        })
+        .collect()
+}
+
+/// Build one [`StickInstance`] per resolved bond. Device-free, unit-testable.
+fn stick_instances_from_bonds(resolved: &[(u32, u32, [f32; 3], [f32; 3])]) -> Vec<StickInstance> {
+    resolved
+        .iter()
+        .map(|(a, b, pa, pb)| StickInstance {
+            p0_radius: [pa[0], pa[1], pa[2], BASE_STICK_RADIUS],
+            p1_pad: [pb[0], pb[1], pb[2], 0.0],
+            groups: [*a, *b],
+            _pad: [0, 0],
+        })
+        .collect()
+}
+
+/// Cheap signature over the resolved bonds, so an unrelated rebuild
+/// (e.g. color-only) doesn't re-run resolution/upload every frame.
+fn hash_bonds(bonds: &[(u32, u32, [f32; 3], [f32; 3])]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bonds.len().hash(&mut hasher);
+    for (a, b, pa, pb) in bonds {
+        a.hash(&mut hasher);
+        b.hash(&mut hasher);
+        for c in pa.iter().chain(pb.iter()) {
+            c.to_bits().hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
 
 pub struct NucleicLadderRep {
     instance_buf: Option<wgpu::Buffer>,
@@ -60,72 +158,6 @@ impl NucleicLadderRep {
     }
 }
 
-/// Resolve detected base pairs to their `C1'` world positions, as plain
-/// tuples `(atom_a, atom_b, pos_a, pos_b)` -- device-free so it's directly
-/// unit-testable (see [`tests::resolves_one_pair_with_matching_positions`]).
-///
-/// A pair is dropped unless *both* `C1'` atoms currently have the cartoon
-/// representation visible (`repr.visible_reps` -- the same per-atom bit
-/// `cartoon.wgsl`'s fragment shader checks via `scene_atom_in_rep` to
-/// discard hidden cartoon pixels). Rungs are drawn through the stick
-/// pipeline directly, bypassing both that shader and the stick
-/// compute-build's own bond/atom visibility filtering, so without this
-/// check they'd ignore "hide cartoon" entirely.
-fn resolve_pairs(
-    molecule: &ObjectMolecule,
-    coord_set: &CoordSet,
-) -> Vec<(u32, u32, [f32; 3], [f32; 3])> {
-    detect_base_pairs(molecule, coord_set)
-        .iter()
-        .filter_map(|p| {
-            let atom_a = molecule.get_atom(p.c1_a)?;
-            let atom_b = molecule.get_atom(p.c1_b)?;
-            if !atom_a.repr.visible_reps.is_visible(RepMask::CARTOON)
-                || !atom_b.repr.visible_reps.is_visible(RepMask::CARTOON)
-            {
-                return None;
-            }
-            let pa = coord_set.get_atom_coord(p.c1_a)?;
-            let pb = coord_set.get_atom_coord(p.c1_b)?;
-            Some((
-                p.c1_a.as_u32(),
-                p.c1_b.as_u32(),
-                [pa.x, pa.y, pa.z],
-                [pb.x, pb.y, pb.z],
-            ))
-        })
-        .collect()
-}
-
-/// Build one [`StickInstance`] rung per resolved pair. Device-free, unit-testable.
-fn rung_instances_from_pairs(resolved: &[(u32, u32, [f32; 3], [f32; 3])]) -> Vec<StickInstance> {
-    resolved
-        .iter()
-        .map(|(a, b, pa, pb)| StickInstance {
-            p0_radius: [pa[0], pa[1], pa[2], RUNG_RADIUS],
-            p1_pad: [pb[0], pb[1], pb[2], 0.0],
-            groups: [*a, *b],
-            _pad: [0, 0],
-        })
-        .collect()
-}
-
-/// Cheap signature over the base pairs found, so an unrelated rebuild
-/// (e.g. color-only) doesn't re-run detection/upload every frame.
-fn hash_pairs(pairs: &[(u32, u32, [f32; 3], [f32; 3])]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    pairs.len().hash(&mut hasher);
-    for (a, b, pa, pb) in pairs {
-        a.hash(&mut hasher);
-        b.hash(&mut hasher);
-        for c in pa.iter().chain(pb.iter()) {
-            c.to_bits().hash(&mut hasher);
-        }
-    }
-    hasher.finish()
-}
-
 impl Representation for NucleicLadderRep {
     fn kind(&self) -> RepKind {
         RepKind::NucleicLadder
@@ -147,16 +179,14 @@ impl Representation for NucleicLadderRep {
             return;
         }
 
-        // Unlike CartoonRep, rung visibility is baked into `resolved` at
-        // build time (see `resolve_pairs`'s per-atom CARTOON check) rather
-        // than gated later in a fragment shader -- so, unintuitively,
-        // `DirtyFlags::VISIBILITY` (part of CartoonRep's `LUT_ONLY_MASK`
-        // fast path) *must* trigger a real rebuild here, or `hide cartoon`
-        // would leave stale rungs on screen. No fast path: just recompute
-        // and rely on `hash_pairs`/`last_signature` below to skip the
-        // upload when nothing relevant actually changed.
-        let resolved = resolve_pairs(input.molecule, input.coord_set);
-        let sig = hash_pairs(&resolved);
+        // No fast path on `_dirty`: bond visibility is baked into
+        // `resolved` here (unlike CartoonRep, whose visibility gating
+        // lives entirely in a fragment shader and needs no CPU rebuild),
+        // so skipping rebuild on visibility-only dirty would mean `hide
+        // cartoon` never re-resolves. hash_bonds/last_signature below
+        // still skips the redundant upload when nothing changed.
+        let resolved = resolve_base_bonds(input.molecule, input.coord_set);
+        let sig = hash_bonds(&resolved);
         if self.last_signature == Some(sig) {
             return;
         }
@@ -168,7 +198,7 @@ impl Representation for NucleicLadderRep {
             return;
         }
 
-        let instances = rung_instances_from_pairs(&resolved);
+        let instances = stick_instances_from_bonds(&resolved);
 
         self.instance_buf = Some(device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("patinae.nucleic_ladder.instances"),
@@ -243,121 +273,96 @@ impl Representation for NucleicLadderRep {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use patinae_mol::{AtomBuilder, AtomFlags, AtomResidue, MoleculeBuilder};
+    use patinae_mol::{AtomBuilder, AtomResidue, BondOrder, MoleculeBuilder};
     use std::sync::Arc;
 
-    #[allow(clippy::too_many_arguments)]
-    fn add_residue(
-        mut b: MoleculeBuilder,
-        chain: &str,
-        resn: &str,
-        resv: i32,
-        c1: [f32; 3],
-        wc_name: &str,
-        wc: [f32; 3],
-        cartoon_visible: bool,
-    ) -> MoleculeBuilder {
-        let res = Arc::new(AtomResidue::from_parts(chain, resn, resv, ' ', ""));
-        let mut c1_atom = AtomBuilder::new().name("C1'").element_symbol("C").build();
-        c1_atom.residue = res.clone();
-        c1_atom.state.flags |= AtomFlags::NUCLEIC | AtomFlags::POLYMER;
-        if cartoon_visible {
-            c1_atom.repr.visible_reps.set_visible(RepMask::CARTOON);
-        }
-        b = b.add_atom(c1_atom, lin_alg::f32::Vec3::new(c1[0], c1[1], c1[2]));
+    /// A minimal single nucleotide with real bonds: P-O5'-C5'-C4'-...-C1'
+    /// backbone (all backbone-backbone, should be excluded) and a
+    /// C1'-N1 glycosidic bond plus one N1-C2 ring bond (both should be
+    /// included, since N1/C2 aren't backbone atom names).
+    fn one_nucleotide_molecule(cartoon_visible: bool) -> ObjectMolecule {
+        let mut b = MoleculeBuilder::new("nt");
+        let res = Arc::new(AtomResidue::from_parts("A", "DA", 1, ' ', ""));
 
-        let mut wc_atom = AtomBuilder::new().name(wc_name).element_symbol("N").build();
-        wc_atom.residue = res;
-        wc_atom.state.flags |= AtomFlags::NUCLEIC | AtomFlags::POLYMER;
-        if cartoon_visible {
-            wc_atom.repr.visible_reps.set_visible(RepMask::CARTOON);
-        }
-        b.add_atom(wc_atom, lin_alg::f32::Vec3::new(wc[0], wc[1], wc[2]))
-    }
+        let add = |b: MoleculeBuilder, name: &str, x: f32| -> MoleculeBuilder {
+            let mut atom = AtomBuilder::new().name(name).element_symbol("C").build();
+            atom.residue = res.clone();
+            atom.state.flags |= AtomFlags::NUCLEIC | AtomFlags::POLYMER;
+            if cartoon_visible {
+                atom.repr.visible_reps.set_visible(RepMask::CARTOON);
+            }
+            b.add_atom(atom, lin_alg::f32::Vec3::new(x, 0.0, 0.0))
+        };
 
-    /// A1/B(-1) from the idealized ATGC/GCAT duplex used in
-    /// `basepair::tests` -- a known, hand-verified Watson-Crick pair (real
-    /// coordinates from PyMOL's `fnab`, not hand-waved).
-    fn one_pair_molecule() -> ObjectMolecule {
-        one_pair_molecule_with_visibility(true, true)
-    }
+        b = add(b, "C1'", 0.0);
+        b = add(b, "N1", 1.0);
+        b = add(b, "C2", 2.0);
+        let mut built = b.build();
 
-    fn one_pair_molecule_with_visibility(a_visible: bool, b_visible: bool) -> ObjectMolecule {
-        let b = MoleculeBuilder::new("pair");
-        let b = add_residue(
-            b,
-            "A",
-            "DA",
-            1,
-            [1.256415, 5.500146, -0.007610],
-            "N1",
-            [-0.498585, 0.670146, -0.007610],
-            a_visible,
-        );
-        let b = add_residue(
-            b,
-            "B",
-            "DT",
-            -1,
-            [1.256415, -5.187853, -0.039610],
-            "N3",
-            [-0.882585, -2.182853, 0.099390],
-            b_visible,
-        );
-        b.build()
+        let idx_c1 = built.atoms_indexed().nth(0).unwrap().0;
+        let idx_n1 = built.atoms_indexed().nth(1).unwrap().0;
+        let idx_c2 = built.atoms_indexed().nth(2).unwrap().0;
+        let _ = built.add_bond(idx_c1, idx_n1, BondOrder::Single);
+        let _ = built.add_bond(idx_n1, idx_c2, BondOrder::Aromatic);
+        built
     }
 
     #[test]
-    fn resolves_one_pair_with_matching_positions() {
-        let mol = one_pair_molecule();
+    fn includes_glycosidic_and_ring_bonds_not_pure_backbone() {
+        let mol = one_nucleotide_molecule(true);
         let coord = mol.current_coord_set().expect("coord set").clone();
-        let resolved = resolve_pairs(&mol, &coord);
-        assert_eq!(resolved.len(), 1);
-        let (a, b, pa, pb) = resolved[0];
-        // C1' of residue A1 is atom index 0, C1' of residue B(-1) is atom
-        // index 2 (C1', WC atom pairs added per-residue).
-        assert_eq!((a, b), (0, 2));
-        assert!((pa[1] - 5.500146).abs() < 1e-4);
-        assert!((pb[1] - (-5.187853)).abs() < 1e-4);
+        let resolved = resolve_base_bonds(&mol, &coord);
+        // C1'-N1 (backbone-to-base) and N1-C2 (base-to-base) both
+        // included; there is no pure backbone-backbone bond in this
+        // fixture to exclude, but the base atoms are what matter here.
+        assert_eq!(resolved.len(), 2);
     }
 
     #[test]
-    fn builds_one_rung_instance_with_expected_radius_and_groups() {
-        let mol = one_pair_molecule();
+    fn excludes_pure_backbone_backbone_bond() {
+        let mut mol = one_nucleotide_molecule(true);
+        // Add a second backbone atom and a pure backbone-backbone bond.
+        let mut o5 = AtomBuilder::new().name("O5'").element_symbol("O").build();
+        o5.residue = Arc::new(AtomResidue::from_parts("A", "DA", 1, ' ', ""));
+        o5.state.flags |= AtomFlags::NUCLEIC | AtomFlags::POLYMER;
+        o5.repr.visible_reps.set_visible(RepMask::CARTOON);
+        let idx_o5 = mol.add_atom(o5);
+        mol.set_coord(idx_o5, 0, lin_alg::f32::Vec3::new(-1.0, 0.0, 0.0));
+        let idx_c1 = mol.atoms_indexed().next().unwrap().0;
+        let _ = mol.add_bond(idx_o5, idx_c1, BondOrder::Single);
+
         let coord = mol.current_coord_set().expect("coord set").clone();
-        let resolved = resolve_pairs(&mol, &coord);
-        let instances = rung_instances_from_pairs(&resolved);
-        assert_eq!(instances.len(), 1);
-        let inst = instances[0];
-        assert_eq!(inst.p0_radius[3], RUNG_RADIUS);
-        assert_eq!(inst.groups, [0, 2]);
-        assert!((inst.p0_radius[1] - 5.500146).abs() < 1e-4);
-        assert!((inst.p1_pad[1] - (-5.187853)).abs() < 1e-4);
+        let resolved = resolve_base_bonds(&mol, &coord);
+        // Still just the glycosidic + ring bond; O5'-C1' (both backbone
+        // names) must not appear.
+        assert_eq!(resolved.len(), 2);
+        for (a, b, _, _) in &resolved {
+            assert!(*a != idx_o5.as_u32() && *b != idx_o5.as_u32());
+        }
     }
 
     #[test]
-    fn no_pairs_yields_no_instances() {
+    fn excludes_bonds_when_cartoon_hidden() {
+        let mol = one_nucleotide_molecule(false);
+        let coord = mol.current_coord_set().expect("coord set").clone();
+        assert!(resolve_base_bonds(&mol, &coord).is_empty());
+    }
+
+    #[test]
+    fn builds_stick_instance_per_resolved_bond() {
+        let mol = one_nucleotide_molecule(true);
+        let coord = mol.current_coord_set().expect("coord set").clone();
+        let resolved = resolve_base_bonds(&mol, &coord);
+        let instances = stick_instances_from_bonds(&resolved);
+        assert_eq!(instances.len(), resolved.len());
+        for inst in &instances {
+            assert_eq!(inst.p0_radius[3], BASE_STICK_RADIUS);
+        }
+    }
+
+    #[test]
+    fn no_bonds_yields_no_instances() {
         let resolved: Vec<(u32, u32, [f32; 3], [f32; 3])> = Vec::new();
-        assert!(rung_instances_from_pairs(&resolved).is_empty());
-    }
-
-    #[test]
-    fn pair_dropped_when_cartoon_hidden_for_either_side() {
-        // Regression test: rungs are drawn through the stick pipeline
-        // directly, bypassing both cartoon.wgsl's per-atom `discard` and
-        // the stick compute-build's own visibility filtering, so without
-        // resolve_pairs' explicit CARTOON check, `hide cartoon` would
-        // leave stale rungs on screen.
-        let both_hidden = one_pair_molecule_with_visibility(false, false);
-        let coord = both_hidden.current_coord_set().expect("coord set").clone();
-        assert!(resolve_pairs(&both_hidden, &coord).is_empty());
-
-        let one_hidden = one_pair_molecule_with_visibility(true, false);
-        let coord = one_hidden.current_coord_set().expect("coord set").clone();
-        assert!(resolve_pairs(&one_hidden, &coord).is_empty());
-
-        let both_visible = one_pair_molecule_with_visibility(true, true);
-        let coord = both_visible.current_coord_set().expect("coord set").clone();
-        assert_eq!(resolve_pairs(&both_visible, &coord).len(), 1);
+        assert!(stick_instances_from_bonds(&resolved).is_empty());
     }
 }
