@@ -33,6 +33,7 @@
 //!   the actual `cs_main` dispatch.
 
 pub mod backbone;
+pub mod basepair;
 pub mod frame;
 pub mod tessellation;
 pub mod utils;
