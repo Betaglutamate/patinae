@@ -35,6 +35,7 @@
 pub mod backbone;
 pub mod basepair;
 pub mod frame;
+pub mod ladder;
 pub mod tessellation;
 pub mod utils;
 
