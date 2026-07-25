@@ -34,6 +34,7 @@
 
 pub mod backbone;
 pub mod frame;
+pub mod ladder;
 pub mod tessellation;
 pub mod utils;
 

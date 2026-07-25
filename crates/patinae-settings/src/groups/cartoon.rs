@@ -33,6 +33,9 @@ define_settings_group! {
         smooth_loops: bool = false,
             name = "cartoon_smooth_loops",
             side_effects = [RepresentationRebuild];
+        nucleic_ladder: bool = true,
+            name = "cartoon_nucleic_ladder",
+            side_effects = [RepresentationRebuild];
         flat_cycles: i32 = 4,
             name = "cartoon_flat_cycles",
             side_effects = [RepresentationRebuild];

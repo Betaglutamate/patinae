@@ -12,6 +12,7 @@ use crate::picking::RepKind;
 use crate::render_input::RenderObjectInput;
 use crate::render_state::state::GeometryRuntime;
 use crate::representation_budget::{RepBudgetRequest, RepMemoryEstimate, RepQualityLevel};
+use crate::representations::cartoon::ladder::NucleicLadderRep;
 use crate::representations::cartoon::CartoonRep;
 use crate::representations::dot::DotRep;
 use crate::representations::ellipsoid::EllipsoidRep;
@@ -152,6 +153,9 @@ impl RepCatalogEntry {
             RepKind::Surface => Some(&geometry.surface_pipeline.pipeline_opaque),
             RepKind::Cartoon | RepKind::Ribbon => Some(&geometry.cartoon_pipeline.pipeline_opaque),
             RepKind::Ellipsoid => Some(&geometry.ellipsoid_pipeline.pipeline_opaque),
+            // Reuses the stick pipeline object directly -- no dedicated
+            // pipeline for rungs.
+            RepKind::NucleicLadder => Some(&geometry.stick_pipeline.pipeline_opaque),
             _ => None,
         }
     }
@@ -169,6 +173,7 @@ impl RepCatalogEntry {
             RepKind::Surface => Some(&geometry.surface_pipeline.pipeline),
             RepKind::Cartoon | RepKind::Ribbon => Some(&geometry.cartoon_pipeline.pipeline),
             RepKind::Ellipsoid => Some(&geometry.ellipsoid_pipeline.pipeline),
+            RepKind::NucleicLadder => Some(&geometry.stick_pipeline.pipeline),
             _ => None,
         }
     }
@@ -311,6 +316,20 @@ fn estimate_ellipsoid(
     crate::representations::ellipsoid::budget_estimates(input)
 }
 
+fn nucleic_ladder(device: &wgpu::Device) -> Box<dyn Representation> {
+    Box::new(NucleicLadderRep::new(device))
+}
+
+fn estimate_nucleic_ladder(
+    _input: &RenderObjectInput<'_>,
+    _settings: &patinae_settings::ResolvedSettings,
+) -> Vec<RepMemoryEstimate> {
+    // Rung instance buffers are tiny (one StickInstance per base pair) --
+    // not worth a real estimate; `budget_request` fills in a zero-cost
+    // default when this returns empty.
+    Vec::new()
+}
+
 // Every built-in rep budgets against *counts* (atom/partition topology,
 // enabled reps, visibility, LOD) rather than coordinates. Surface/Mesh/
 // Cartoon/Ribbon used to add COORDS here (`GEOMETRY_BUDGET_DIRTY`) because
@@ -403,6 +422,17 @@ pub(crate) const REPS: &[RepCatalogEntry] = &[
         estimator: estimate_ellipsoid,
         budget_invalidating_dirty: COUNT_BUDGET_DIRTY,
         cullable: true,
+        picking_scene_group: false,
+    },
+    RepCatalogEntry {
+        kind: RepKind::NucleicLadder,
+        // Shares Cartoon's visibility bit: rungs show/hide alongside the
+        // cartoon representation, no separate "show" command needed.
+        mask: RepMask::CARTOON,
+        constructor: nucleic_ladder,
+        estimator: estimate_nucleic_ladder,
+        budget_invalidating_dirty: COUNT_BUDGET_DIRTY,
+        cullable: false,
         picking_scene_group: false,
     },
 ];
