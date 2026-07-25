@@ -56,6 +56,9 @@ fn ss_from_u8(v: u8) -> SecondaryStructure {
         2 => SecondaryStructure::Sheet,
         3 => SecondaryStructure::Helix310,
         4 => SecondaryStructure::HelixPi,
+        5 => SecondaryStructure::Turn,
+        6 => SecondaryStructure::Bend,
+        7 => SecondaryStructure::NucleicRibbon,
         _ => SecondaryStructure::Loop,
     }
 }
@@ -598,7 +601,13 @@ fn find_sheet_runs(gps: &[GuidePoint]) -> Vec<(usize, usize)> {
     let mut runs = Vec::new();
     let mut first: Option<usize> = None;
     for (a, gp) in gps.iter().enumerate() {
-        if gp.ss_type.is_flat_ribbon() {
+        // Beta-sheet only: `flatten_sheets` is tuned to iron out a short
+        // (3-10 residue) strand's CA zig-zag into a plane. Nucleic acid
+        // guide points are also `is_flat_ribbon()`, but running the same
+        // window-averaging over an entire 20-30+ nt strand erases the
+        // backbone's natural helical twist -- the exact signal that makes
+        // it read as a double helix instead of a flat/straight band.
+        if gp.ss_type.is_sheet() {
             if first.is_none() {
                 first = Some(a);
             }
@@ -1089,6 +1098,53 @@ mod tests {
             cartoon_type_for(SecondaryStructure::Loop, &geom),
             CartoonType::Loop
         );
+    }
+
+    #[test]
+    fn ss_from_u8_roundtrips_all_variants() {
+        let variants = [
+            SecondaryStructure::Loop,
+            SecondaryStructure::Helix,
+            SecondaryStructure::Sheet,
+            SecondaryStructure::Helix310,
+            SecondaryStructure::HelixPi,
+            SecondaryStructure::Turn,
+            SecondaryStructure::Bend,
+            SecondaryStructure::NucleicRibbon,
+        ];
+        for ss in variants {
+            assert_eq!(ss_from_u8(ss as u8), ss, "round-trip failed for {ss:?}");
+        }
+    }
+
+    #[test]
+    fn find_sheet_runs_excludes_nucleic_ribbon() {
+        // A run of NucleicRibbon guide points must not be treated as a
+        // sheet run -- flatten_sheets' window-averaging is tuned for a
+        // short beta-strand zig-zag and would iron out a nucleic strand's
+        // helical twist if applied to it.
+        let gps: Vec<GuidePoint> = (0..20)
+            .map(|i| GuidePoint {
+                position: Vec3::new(i as f32, 0.0, 0.0),
+                orientation: Vec3::new(0.0, 0.0, 1.0),
+                ss_type: SecondaryStructure::NucleicRibbon,
+                atom_idx: i,
+            })
+            .collect();
+        assert!(find_sheet_runs(&gps).is_empty());
+    }
+
+    #[test]
+    fn find_sheet_runs_still_finds_sheet() {
+        let gps: Vec<GuidePoint> = (0..5)
+            .map(|i| GuidePoint {
+                position: Vec3::new(i as f32, 0.0, 0.0),
+                orientation: Vec3::new(0.0, 0.0, 1.0),
+                ss_type: SecondaryStructure::Sheet,
+                atom_idx: i,
+            })
+            .collect();
+        assert_eq!(find_sheet_runs(&gps), vec![(0, 4)]);
     }
 
     #[test]
