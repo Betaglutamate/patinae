@@ -299,7 +299,7 @@ mod tests {
         b = add(b, "C2", 2.0);
         let mut built = b.build();
 
-        let idx_c1 = built.atoms_indexed().nth(0).unwrap().0;
+        let idx_c1 = built.atoms_indexed().next().unwrap().0;
         let idx_n1 = built.atoms_indexed().nth(1).unwrap().0;
         let idx_c2 = built.atoms_indexed().nth(2).unwrap().0;
         let _ = built.add_bond(idx_c1, idx_n1, BondOrder::Single);
