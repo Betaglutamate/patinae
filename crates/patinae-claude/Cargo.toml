@@ -1,0 +1,18 @@
+[package]
+name = "patinae-claude"
+description = "Claude assistant core for Patinae: agent state, tool schema, and API client"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+
+[dependencies]
+patinae-settings = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

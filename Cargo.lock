@@ -4136,6 +4136,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "patinae-claude"
+version = "0.4.4"
+dependencies = [
+ "patinae-settings",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "patinae-cmd"
 version = "0.4.4"
 dependencies = [

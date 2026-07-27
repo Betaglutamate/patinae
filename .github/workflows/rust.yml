@@ -21,6 +21,16 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # Runs before the expensive setup steps so a leaked credential fails fast.
+      # Markdown is excluded so docs can show the `sk-ant-...` key shape.
+      - name: Scan for committed API keys
+        run: |
+          if git grep -nIE 'sk-ant-[A-Za-z0-9_-]{20,}' -- . ':!*.md'; then
+            echo "::error::Possible Anthropic API key committed - remove it and rotate the key"
+            exit 1
+          fi
+          echo "No API keys found in tracked files."
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:

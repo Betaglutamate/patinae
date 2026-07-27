@@ -22,3 +22,9 @@ web/assets/1fsd.cif
 web/assets/3J3Q.cif
 paper
 techdocs/
+
+# Claude assistant credentials (the real config lives in ~/.patinae, but never
+# let a stray copy be committed)
+claude.json
+*.claude.json
+.env.*
