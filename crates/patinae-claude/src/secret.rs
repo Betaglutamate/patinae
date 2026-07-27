@@ -56,8 +56,8 @@ impl SecretString {
 
     /// Returns a display-safe identifier such as `sk-ant-…a1b2`.
     ///
-    /// Reveals at most the key prefix and the last [`FINGERPRINT_TAIL`]
-    /// characters, never the middle. Short values are fully masked so a
+    /// Reveals at most the key prefix and the last four characters, never the
+    /// middle. Short values are fully masked so a
     /// truncated or malformed key cannot be reconstructed from its
     /// fingerprint.
     pub fn fingerprint(&self) -> String {
