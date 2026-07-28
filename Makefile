@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help clean check test \
+.PHONY: help clean check check-release-metadata test \
        patinae patinae-dev patinae-fast patinae-fast-plugins \
        plugins plugins-install \
        python-release python-dev \
@@ -15,7 +15,7 @@
 
 APP_NAME       := Patinae
 BUNDLE_ID      := me.yakovlev.patinae
-VERSION        := 0.4.4
+VERSION        := 0.4.5
 BINARY_NAME    := patinae
 
 CARGO          ?= cargo
@@ -97,10 +97,13 @@ endif
 # ── Build ─────────────────────────────────────────────────────────
 
 check:
-	$(CARGO) check --workspace
+	$(CARGO) check --locked --workspace
+
+check-release-metadata:
+	bash scripts/check-release-metadata.sh
 
 test:
-	$(CARGO) test
+	$(CARGO) test --locked
 
 clean:
 	$(CARGO) clean
@@ -110,7 +113,7 @@ clean:
 # ── Patinae (Slint GUI) ──────────────────────────────────────────
 
 patinae:
-	$(CARGO) build -p patinae --release
+	$(CARGO) build --locked -p patinae --release
 
 patinae-dev:
 	$(CARGO) run -p patinae
@@ -134,7 +137,7 @@ PLUGIN_CRATES += -p ipc-plugin
 endif
 
 plugins:
-	$(CARGO) build --release $(PLUGIN_CRATES)
+	$(CARGO) build --locked --release $(PLUGIN_CRATES)
 ifeq ($(OS),Windows_NT)
 	powershell -NoProfile -Command "if (Test-Path '$(PLUGIN_STAGE_DIR)') { Remove-Item -Recurse -Force '$(PLUGIN_STAGE_DIR)' }"
 	$(MKDIRP) $(PLUGIN_STAGE_DIR)
@@ -368,6 +371,7 @@ version:
 help:
 	@echo "Build:"
 	@echo "  check            Check the Rust workspace"
+	@echo "  check-release-metadata  Check release versions and Cargo lockfiles"
 	@echo "  test             Run tests"
 	@echo "  clean            Clean all build artifacts"
 	@echo ""

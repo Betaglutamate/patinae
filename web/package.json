@@ -1,6 +1,6 @@
 {
   "name": "@patinae/viewer",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "description": "Embeddable WebGPU molecular visualization component powered by Patinae",
   "type": "module",
   "main": "dist/patinae-viewer.js",
@@ -17,7 +17,7 @@
     "pkg"
   ],
   "scripts": {
-    "wasm:build": "wasm-pack build --target web --out-dir pkg --no-opt",
+    "wasm:build": "wasm-pack build --target web --out-dir pkg --no-opt -- --locked",
     "dev": "npm run wasm:build && vite",
     "build": "npm run wasm:build && vite build",
     "preview": "vite preview"

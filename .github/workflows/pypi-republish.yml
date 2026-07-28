@@ -16,8 +16,25 @@ permissions:
   contents: read
 
 jobs:
+  validate-release:
+    name: Validate release metadata
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check versions and Cargo lockfiles
+        run: make check-release-metadata
+
   build-web:
     name: Build web assets
+    needs: [validate-release]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -134,7 +151,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter
+          args: --release --locked --out dist --find-interpreter
           manylinux: ${{ matrix.manylinux || 'auto' }}
           working-directory: python
 
@@ -147,6 +164,7 @@ jobs:
 
   build-sdist:
     name: Build sdist
+    needs: [validate-release]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -160,6 +178,8 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: sdist
+          # maturin 1.14 sdist does not accept Cargo's --locked option.
+          # The validate-release job checks python/Cargo.lock before any builds start.
           args: --out dist
           working-directory: python
 

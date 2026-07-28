@@ -19,8 +19,25 @@ permissions:
   contents: read
 
 jobs:
+  validate-release:
+    name: Validate release metadata
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check versions and Cargo lockfiles
+        run: make check-release-metadata
+
   resolve_pypi_version:
     name: Resolve PyPI version
+    needs: [validate-release]
     runs-on: ubuntu-latest
     outputs:
       base_version: ${{ steps.version.outputs.base_version }}
@@ -84,6 +101,7 @@ jobs:
 
   build-executables:
     name: Build ${{ matrix.name }}
+    needs: [validate-release]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -158,6 +176,7 @@ jobs:
 
   build-plugins:
     name: Build plugins ${{ matrix.name }}
+    needs: [validate-release]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -318,7 +337,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter
+          args: --release --locked --out dist --find-interpreter
           manylinux: ${{ matrix.manylinux || 'auto' }}
           working-directory: python
 
@@ -349,6 +368,8 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: sdist
+          # maturin 1.14 sdist does not accept Cargo's --locked option.
+          # The validate-release job checks python/Cargo.lock before any builds start.
           args: --out dist
           working-directory: python
 
@@ -361,6 +382,7 @@ jobs:
 
   build-web:
     name: Build web libraries
+    needs: [validate-release]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -564,7 +586,18 @@ jobs:
 
   publish-pypi:
     name: Publish to PyPI
-    needs: [build-wheels, build-sdist, resolve_pypi_version]
+    needs:
+      [
+        validate-release,
+        resolve_pypi_version,
+        build-executables,
+        build-plugins,
+        build-wheels,
+        build-sdist,
+        build-web,
+        build-dmg,
+        build-bundle-windows,
+      ]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -584,16 +617,7 @@ jobs:
 
   release:
     name: Create Release
-    needs:
-      [
-        build-executables,
-        build-plugins,
-        build-wheels,
-        build-sdist,
-        build-web,
-        build-dmg,
-        build-bundle-windows,
-      ]
+    needs: [publish-pypi]
     runs-on: ubuntu-latest
     permissions:
       contents: write

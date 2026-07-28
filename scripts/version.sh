@@ -16,6 +16,8 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CARGO_BIN="${CARGO:-cargo}"
+CARGO_HOST_TARGET="$("$CARGO_BIN" -vV | sed -n 's/^host: //p')"
 cd "$ROOT"
 
 # Detect current version from workspace Cargo.toml
@@ -27,11 +29,10 @@ if [ -z "$OLD" ]; then
 fi
 
 if [ "$OLD" = "$NEW" ]; then
-    echo "Version is already $NEW — nothing to do."
-    exit 0
+    echo "Version is already $NEW — refreshing release metadata."
+else
+    echo "Updating version: $OLD -> $NEW"
 fi
-
-echo "Updating version: $OLD -> $NEW"
 echo ""
 
 update_file() {
@@ -46,6 +47,19 @@ update_file() {
     count=$(grep -c "$pattern" "$file" || true)
     sed -i '' "s|$pattern|$replacement|g" "$file"
     echo "  OK    $file ($count replacement(s))"
+}
+
+refresh_lockfile() {
+    local manifest="$1"
+    local target="$2"
+    local lockfile="${manifest%Cargo.toml}Cargo.lock"
+    "$CARGO_BIN" metadata \
+        --manifest-path "$manifest" \
+        --filter-platform "$target" \
+        --offline \
+        --format-version 1 \
+        >/dev/null
+    echo "  OK    $lockfile"
 }
 
 # Workspace root Cargo.toml (workspace.package version + dependency versions)
@@ -68,10 +82,21 @@ update_file "web/Cargo.toml" \
     "version = \"$OLD\"" \
     "version = \"$NEW\""
 
-# Web package.json
-update_file "web/package.json" \
-    "\"version\": \"$OLD\"" \
-    "\"version\": \"$NEW\""
+# Web package metadata (package.json + package-lock.json)
+if command -v npm >/dev/null 2>&1; then
+    (
+        cd web
+        npm version "$NEW" \
+            --no-git-tag-version \
+            --allow-same-version \
+            --ignore-scripts \
+            >/dev/null
+    )
+    echo "  OK    web/package.json + web/package-lock.json"
+else
+    echo "Error: npm is required to update web package metadata" >&2
+    exit 1
+fi
 
 # README version badge
 if [ -f "README.md" ]; then
@@ -95,6 +120,12 @@ if [ -f "Makefile" ]; then
 else
     echo "  SKIP  Makefile (not found)"
 fi
+
+echo ""
+echo "Refreshing Cargo lockfiles..."
+refresh_lockfile "Cargo.toml" "$CARGO_HOST_TARGET"
+refresh_lockfile "python/Cargo.toml" "$CARGO_HOST_TARGET"
+refresh_lockfile "web/Cargo.toml" "wasm32-unknown-unknown"
 
 echo ""
 echo "Done. Version updated to $NEW."

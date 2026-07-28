@@ -38,6 +38,9 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
 
+      - name: Check release metadata
+        run: make check-release-metadata
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -47,22 +50,22 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
         env:
           PYO3_PYTHON: python3
 
       - name: Check workspace
-        run: cargo check --workspace
+        run: cargo check --locked --workspace
         env:
           PYO3_PYTHON: python3
 
       - name: Run workspace tests
-        run: cargo test --workspace --verbose
+        run: cargo test --locked --workspace --verbose
         env:
           PYO3_PYTHON: python3
 
       - name: Check Python crate
-        run: cargo check --manifest-path python/Cargo.toml
+        run: cargo check --locked --manifest-path python/Cargo.toml
         env:
           PYO3_PYTHON: python3
 
@@ -70,7 +73,7 @@ jobs:
         run: rustup target add wasm32-unknown-unknown
 
       - name: Check web WASM crate
-        run: cargo check --manifest-path web/Cargo.toml --target wasm32-unknown-unknown
+        run: cargo check --locked --manifest-path web/Cargo.toml --target wasm32-unknown-unknown
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -87,6 +90,6 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
-          args: --release --out dist --find-interpreter
+          args: --release --locked --out dist --find-interpreter
           manylinux: auto
           working-directory: python
