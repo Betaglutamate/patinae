@@ -8,8 +8,13 @@ pub mod stream;
 pub mod types;
 
 use std::sync::OnceLock;
+use std::time::Duration;
 
 /// Anthropic Messages endpoint.
+///
+/// Hardcoded, and deliberately not settings-overridable: the request carries the
+/// user's OAuth bearer token, so a configurable base URL would be a way to point
+/// that credential at an arbitrary host.
 pub const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 
 /// Wire version pinned by the Messages API.
@@ -58,11 +63,28 @@ impl std::fmt::Display for ApiError {
     }
 }
 
+/// How long to wait for the TCP+TLS handshake.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the stream may go silent before the request is abandoned.
+///
+/// This is a per-read inactivity timeout, not a deadline on the whole request:
+/// a turn at high effort can legitimately stream for many minutes, and a total
+/// timeout would cut it off mid-answer. The API sends comment heartbeats while
+/// the model works, so silence this long means the connection is gone.
+///
+/// Without any timeout, a hung connection wedges the worker thread indefinitely
+/// — `Stop` is checked between iterations, not inside a blocking read, so there
+/// would be no way to recover short of restarting the viewer.
+const READ_TIMEOUT: Duration = Duration::from_secs(180);
+
 /// Build the shared HTTP client. Call [`ensure_rustls_crypto_provider`] first.
 pub fn build_client() -> Result<reqwest::Client, ApiError> {
     ensure_rustls_crypto_provider();
     reqwest::Client::builder()
         .user_agent(user_agent())
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
         .build()
         .map_err(|e| ApiError::Network(e.to_string()))
 }

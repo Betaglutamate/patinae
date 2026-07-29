@@ -17,7 +17,7 @@
 use patinae_framework::model::sequence::{
     chain_to_fasta, collect_all_sequences, SequenceColorContext, SequenceModel,
 };
-use patinae_plugin::prelude::{select, ViewerLike};
+use patinae_plugin::prelude::{parse_commands, select, ViewerLike};
 use serde_json::{json, Value};
 
 use crate::api::types::Tool;
@@ -32,6 +32,40 @@ pub const COUNT_ATOMS: &str = "count_atoms";
 /// Tools that mutate the scene and therefore pass through approval gating.
 pub fn is_mutating(name: &str) -> bool {
     matches!(name, RUN_COMMAND | RUN_PYTHON)
+}
+
+/// Commands that execute arbitrary code in the viewer's own process.
+///
+/// `run_python` is not the only route to the interpreter. `python` (and its `/`
+/// alias) is a registered command like any other, so `run_command` can invoke it
+/// directly; `iterate` and `alter` evaluate Python expressions per atom; and
+/// `run` (alias `@`) executes a script file, which may be `.py` or a `.pml`
+/// containing Python. Gating on the *tool* name alone therefore leaves the
+/// interpreter reachable with approval turned off.
+const CODE_EXECUTING_COMMANDS: &[&str] = &["python", "/", "iterate", "alter", "run", "@"];
+
+/// Whether a command string reaches the Python interpreter or a script file in
+/// any of its `;`-separated segments.
+///
+/// Uses the host's own parser rather than splitting on `;`, so quoting, nesting,
+/// comments, and line continuations are interpreted exactly as they will be at
+/// execution time — a hand-rolled split would disagree with the executor, and
+/// any disagreement is a way past the gate.
+///
+/// A string the parser rejects counts as code-executing: it will fail at
+/// execution anyway, so the permissive answer buys nothing and the conservative
+/// one cannot be wrong.
+pub fn executes_code(commands: &str) -> bool {
+    match parse_commands(commands) {
+        Ok(parsed) => parsed.iter().any(|c| is_code_executing(&c.name)),
+        Err(_) => true,
+    }
+}
+
+fn is_code_executing(name: &str) -> bool {
+    CODE_EXECUTING_COMMANDS
+        .iter()
+        .any(|c| name.eq_ignore_ascii_case(c))
 }
 
 /// Build the tool schema list.
@@ -337,6 +371,60 @@ mod tests {
             );
             assert!(!tool.description.is_empty());
         }
+    }
+
+    #[test]
+    fn run_python_reaches_the_interpreter() {
+        assert!(executes_code(
+            &command_for(RUN_PYTHON, &json!({"code": "print(1)"})).unwrap()
+        ));
+    }
+
+    #[test]
+    fn every_route_to_the_interpreter_is_recognised() {
+        // Each of these executes code without going through `run_python`.
+        for cmd in [
+            "python print(1)",
+            "/ print(1)",
+            "iterate all, print(name)",
+            "alter all, b=0",
+            "run evil.py",
+            "@ evil.pml",
+            "PYTHON print(1)",
+        ] {
+            assert!(executes_code(cmd), "{cmd} should count as code execution");
+        }
+    }
+
+    #[test]
+    fn a_code_command_anywhere_in_the_chain_counts() {
+        // The gate must look at every segment, not just the first.
+        assert!(executes_code("load 1crn; show cartoon; python print(1)"));
+        assert!(executes_code("zoom;python print(1);orient"));
+    }
+
+    #[test]
+    fn ordinary_viewer_commands_do_not_count() {
+        for cmd in [
+            "load 1crn",
+            "load 1crn; show cartoon; color green, chain A",
+            "select site, byres around 5 ligand",
+            // Substrings and argument text must not trigger the check — only
+            // the parsed command name does.
+            "load python.pdb",
+            "set_name run, runner",
+            "color red, resn RUN",
+        ] {
+            assert!(!executes_code(cmd), "{cmd} should not count as code");
+        }
+    }
+
+    #[test]
+    fn unparseable_commands_are_treated_as_code() {
+        // Fail closed: a string the executor will reject must not slip through
+        // the gate on the way to being rejected.
+        assert!(executes_code("("));
+        assert!(executes_code("-not-a-command"));
     }
 
     #[test]

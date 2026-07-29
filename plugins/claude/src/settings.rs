@@ -87,19 +87,33 @@ pub fn read_config(shared: &SharedContext<'_>, system_prompt: String) -> Config 
     }
 }
 
+/// Upper bound on either capture edge.
+///
+/// This is the model's maximum long edge; beyond it the image is downscaled
+/// server-side anyway, so the extra pixels are pure cost. It also keeps the
+/// request inside what the GPU will allocate — a capture is a real offscreen
+/// texture plus a full RGBA readback, so an unbounded edge is an out-of-memory
+/// or device-limit failure, not just a large image.
+pub const MAX_CAPTURE_EDGE: i32 = 2576;
+
+/// Clamp one capture edge, saturating rather than truncating.
+///
+/// Applies to model-supplied dimensions as well as settings: `screenshot` takes
+/// optional `width`/`height`, so an unclamped tool argument would walk straight
+/// past the bound the settings path enforces.
+pub fn clamp_capture_edge(value: u64) -> u32 {
+    value.clamp(1, MAX_CAPTURE_EDGE as u64) as u32
+}
+
 /// Screenshot dimensions, clamped so a bad setting cannot request a
 /// zero-pixel or absurdly large capture.
-///
-/// The upper bound is the model's maximum long edge; beyond it the image is
-/// downscaled server-side anyway, so the extra pixels are pure cost.
 pub fn capture_size(shared: &SharedContext<'_>) -> (u32, u32) {
-    const MAX_EDGE: i32 = 2576;
     let w = shared
         .setting_int(CAPTURE_WIDTH, DEFAULT_CAPTURE_WIDTH)
-        .clamp(1, MAX_EDGE);
+        .clamp(1, MAX_CAPTURE_EDGE);
     let h = shared
         .setting_int(CAPTURE_HEIGHT, DEFAULT_CAPTURE_HEIGHT)
-        .clamp(1, MAX_EDGE);
+        .clamp(1, MAX_CAPTURE_EDGE);
     (w as u32, h as u32)
 }
 
@@ -132,6 +146,19 @@ mod tests {
             .find(|d| d.name == MODEL)
             .expect("model descriptor");
         assert_eq!(model.default, SettingValue::String("claude-opus-5".into()));
+    }
+
+    #[test]
+    fn capture_edges_are_clamped_in_both_directions() {
+        assert_eq!(clamp_capture_edge(1024), 1024);
+        assert_eq!(clamp_capture_edge(0), 1, "a zero-pixel capture is invalid");
+        assert_eq!(clamp_capture_edge(100_000), MAX_CAPTURE_EDGE as u32);
+        // Saturating, not truncating: `as u32` alone would turn this into 0.
+        assert_eq!(
+            clamp_capture_edge(u32::MAX as u64 + 1),
+            MAX_CAPTURE_EDGE as u32
+        );
+        assert_eq!(clamp_capture_edge(u64::MAX), MAX_CAPTURE_EDGE as u32);
     }
 
     #[test]

@@ -243,11 +243,32 @@ impl ClaudeHandler {
     ) {
         // Command-backed tools may need approval first.
         if let Some(command) = tools::command_for(name, input) {
-            let auto = ctx.shared.setting_bool(settings::AUTO_APPROVE, false);
             // Python executes arbitrary code in the viewer's own process, so it
-            // always prompts regardless of the auto-approve setting.
-            let always_ask = name == tools::RUN_PYTHON;
-            if auto && !always_ask {
+            // always prompts regardless of the auto-approve setting. The check is
+            // on the command *text*, not the tool name: `python`, `iterate`,
+            // `alter`, and `run` are ordinary registered commands, so gating
+            // `run_python` alone would leave the interpreter one `run_command`
+            // away from executing unattended.
+            let executes_code = tools::executes_code(&command);
+
+            // `claude_allow_python = off` drops `run_python` from the schema, but
+            // the interpreter stays reachable through `run_command`, so the
+            // setting has to be enforced against the command rather than against
+            // the tool list.
+            if executes_code && !ctx.shared.setting_bool(settings::ALLOW_PYTHON, true) {
+                self.note(format!("Blocked (code execution disabled): {command}"));
+                self.reply_text(
+                    call_id,
+                    "Code execution is disabled in this viewer (`claude_allow_python` is \
+                     off). Do not retry; use plain viewer commands instead, or tell the \
+                     user to enable the setting if the task genuinely needs Python.",
+                    true,
+                );
+                return;
+            }
+
+            let auto = ctx.shared.setting_bool(settings::AUTO_APPROVE, false);
+            if auto && !executes_code {
                 self.note(format!("{name} → {command}"));
                 self.run_command_tool(ctx, call_id, &command);
             } else {
@@ -335,20 +356,29 @@ impl ClaudeHandler {
     /// supplies one when applying plugin mutations.
     fn run_screenshot(&self, ctx: &mut PollContext<'_>, call_id: &str, input: &Value) {
         let (default_w, default_h) = settings::capture_size(ctx.shared);
+        // Clamp what the model asked for, not just the settings default: an
+        // unbounded edge here is a GPU allocation the size of the number it sent.
         let width = input
             .get("width")
             .and_then(|v| v.as_u64())
-            .map(|v| v as u32)
+            .map(settings::clamp_capture_edge)
             .unwrap_or(default_w);
         let height = input
             .get("height")
             .and_then(|v| v.as_u64())
-            .map(|v| v as u32)
+            .map(settings::clamp_capture_edge)
             .unwrap_or(default_h);
 
         let tx = self.worker.tx.clone();
+        // The filename comes from a local counter, never from `call_id`: that is
+        // API-supplied text, and interpolating it into a path would let a
+        // malformed id (`../…`) choose where the capture is written.
+        let capture_id = NEXT_EXEC_ID.fetch_add(1, Ordering::SeqCst);
         let call_id = call_id.to_string();
-        let path = std::env::temp_dir().join(format!("patinae-claude-{call_id}.png"));
+        let path = std::env::temp_dir().join(format!(
+            "patinae-claude-{}-{capture_id}.png",
+            std::process::id()
+        ));
 
         ctx.queue_viewer_mutation(move |viewer| {
             let result = viewer.capture_png(&path, Some(width), Some(height));

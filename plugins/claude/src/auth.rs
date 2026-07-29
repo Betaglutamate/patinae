@@ -93,7 +93,7 @@ pub fn access_token() -> Result<String, AuthError> {
         }
     }
 
-    let out = run_ant(&["auth", "print-credentials", "--access-token"])?;
+    let out = run_ant_secret(&["auth", "print-credentials", "--access-token"])?;
     let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if token.is_empty() {
         return Err(AuthError::Failed(
@@ -185,6 +185,30 @@ fn run_ant(args: &[&str]) -> Result<Output, AuthError> {
         .map_err(map_spawn_error)?;
     check_status(&out)?;
     Ok(out)
+}
+
+/// Run `ant` for a command whose **stdout is the secret**, keeping that stdout
+/// out of any error text.
+///
+/// [`combined_output`] folds stdout into the message it builds, and error text
+/// reaches the panel transcript. For `print-credentials` that stdout is the
+/// access token, so a non-zero exit that had already printed it would put the
+/// token on screen. Only stderr is diagnostic here, so only stderr is reported.
+fn run_ant_secret(args: &[&str]) -> Result<Output, AuthError> {
+    let out = Command::new("ant")
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(map_spawn_error)?;
+    if out.status.success() {
+        return Ok(out);
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    Err(AuthError::Failed(if stderr.is_empty() {
+        format!("exited with {}", out.status)
+    } else {
+        stderr
+    }))
 }
 
 fn map_spawn_error(e: io::Error) -> AuthError {
