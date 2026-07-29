@@ -48,6 +48,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "ai-plugin"
+version = "0.4.5"
+dependencies = [
+ "base64",
+ "futures-util",
+ "log",
+ "patinae-framework",
+ "patinae-plugin",
+ "patinae-plugin-host",
+ "patinae-scene",
+ "patinae-settings",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "aligned"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -837,25 +856,6 @@ name = "clap_lex"
 version = "0.7.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3e64b0cc0439b12df2fa678eae89a1c56a529fd067a9115f7827f1fffd22b32"
-
-[[package]]
-name = "claude-plugin"
-version = "0.4.5"
-dependencies = [
- "base64",
- "futures-util",
- "log",
- "patinae-framework",
- "patinae-plugin",
- "patinae-plugin-host",
- "patinae-scene",
- "patinae-settings",
- "reqwest",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
-]
 
 [[package]]
 name = "clipboard-win"

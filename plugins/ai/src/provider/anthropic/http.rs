@@ -4,11 +4,13 @@
 //! the SSE decoder are ours. Everything here is transport-only and runs on the
 //! worker thread — nothing in this module touches viewer state.
 
-pub mod stream;
-pub mod types;
-
 use std::sync::OnceLock;
 use std::time::Duration;
+
+use super::accum::{TurnAccumulator, TurnEvent};
+use super::types;
+use crate::provider::ApiError;
+use crate::sse::SseDecoder;
 
 /// Anthropic Messages endpoint.
 ///
@@ -38,29 +40,7 @@ pub fn ensure_rustls_crypto_provider() {
 
 /// User-Agent sent with every request, matching the pattern used for RCSB fetches.
 pub fn user_agent() -> String {
-    concat!("patinae-claude-plugin/", env!("CARGO_PKG_VERSION")).to_string()
-}
-
-/// A failure while calling the Messages API.
-#[derive(Debug, Clone)]
-pub enum ApiError {
-    /// Transport-level failure (DNS, TLS, connection reset).
-    Network(String),
-    /// The token was rejected. The caller should invalidate the cached token
-    /// and retry once before surfacing this.
-    Unauthorized(String),
-    /// Any other non-2xx response, with the body for diagnosis.
-    Http { status: u16, body: String },
-}
-
-impl std::fmt::Display for ApiError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ApiError::Network(m) => write!(f, "network error: {m}"),
-            ApiError::Unauthorized(m) => write!(f, "authentication rejected: {m}"),
-            ApiError::Http { status, body } => write!(f, "API error {status}: {body}"),
-        }
-    }
+    concat!("patinae-ai-plugin/", env!("CARGO_PKG_VERSION")).to_string()
 }
 
 /// How long to wait for the TCP+TLS handshake.
@@ -98,7 +78,7 @@ pub async fn stream_message(
     client: &reqwest::Client,
     token: &str,
     request: &types::MessagesRequest,
-    mut on_event: impl FnMut(stream::TurnEvent),
+    mut on_event: impl FnMut(TurnEvent),
 ) -> Result<types::AssistantTurn, ApiError> {
     use futures_util::StreamExt;
 
@@ -128,8 +108,8 @@ pub async fn stream_message(
         });
     }
 
-    let mut decoder = stream::SseDecoder::new();
-    let mut acc = stream::TurnAccumulator::new();
+    let mut decoder = SseDecoder::new();
+    let mut acc = TurnAccumulator::new();
     let mut body = response.bytes_stream();
 
     while let Some(chunk) = body.next().await {

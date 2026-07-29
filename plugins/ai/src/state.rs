@@ -89,7 +89,7 @@ impl SharedState {
     /// Render the transcript for the panel's text area.
     pub fn render(&self) -> String {
         if self.transcript.is_empty() {
-            return "Ask Claude to do something with the structure — for example:\n\
+            return "Ask the agent to do something with the structure — for example:\n\
                     \n  load 1crn and show it as cartoon coloured by chain\n\
                     \n  what chains are in this structure and how long are they?"
                 .to_string();

@@ -312,7 +312,7 @@ Plugins are compiled as dynamic libraries (`.dylib` on macOS, `.so` on Linux,
 | **raytracer** | `raytracer-plugin` | GPU ray tracing with BVH acceleration, shadows, transparency, and edge detection |
 | **ipc** | `ipc-plugin` | Inter-process communication plugin for external tool integration |
 | **python** | `python-plugin` | Embedded CPython interpreter for scripting inside the native app |
-| **claude** | `claude-plugin` | Claude AI agent that drives the viewer from natural language |
+| **ai** | `ai-plugin` | AI agent (Claude or Gemini) that drives the viewer from natural language |
 
 Build and stage the reference plugins:
 
@@ -336,17 +336,21 @@ The `python-plugin` embeds CPython directly into the native application. It is
 separate from the standalone Python package: scripts run inside the desktop app
 and issue commands through the same dispatcher as native commands.
 
-### Claude Plugin
+### AI Plugin
 
-The `claude-plugin` puts a Claude agent inside the viewer. Ask for something in
-the Claude panel (bottom dock) or with the `claude` command, and it drives the
-scene itself: running commands, reading loaded structures and sequences, and
-taking screenshots to check its own work.
+The `ai-plugin` puts an AI agent inside the viewer. Ask for something in the AI
+panel (bottom dock) or with the `ai` command, and it drives the scene itself:
+running commands, reading loaded structures and sequences, and taking
+screenshots to check its own work.
 
 ```text
-claude load 1crn and show it as cartoon coloured by chain
-claude what chains are in this structure and how long are they?
+ai load 1crn and show it as cartoon coloured by chain
+ai what chains are in this structure and how long are they?
 ```
+
+The provider is selected with `set ai_provider, claude`. The plugin is
+provider-neutral above the wire layer, but Claude is the only backend
+implemented so far — selecting `gemini` reports that rather than falling back.
 
 Sign-in is brokered through Anthropic's [`ant` CLI](https://platform.claude.com/docs/en/api/sdks/cli),
 which owns the OAuth flow and token refresh — the plugin stores no credential
