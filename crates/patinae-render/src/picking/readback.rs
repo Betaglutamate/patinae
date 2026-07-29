@@ -243,9 +243,7 @@ fn rep_pick_priority(kind: RepKind) -> u32 {
         RepKind::Surface | RepKind::Mesh => 3,
         RepKind::Line => 4,
         RepKind::Dot => 5,
-        // Never actually produced by the picking pass (not pickable), but
-        // the match must stay exhaustive.
-        RepKind::NucleicLadder | RepKind::None => 6,
+        RepKind::None => 6,
     }
 }
 

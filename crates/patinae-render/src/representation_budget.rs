@@ -290,9 +290,7 @@ fn rep_priority(kind: RepKind) -> u8 {
         RepKind::Surface | RepKind::Mesh => 3,
         RepKind::Sphere | RepKind::Stick => 4,
         RepKind::Ellipsoid => 5,
-        // Lowest priority: a decorative accent on top of the cartoon,
-        // first to skip under memory pressure.
-        RepKind::NucleicLadder | RepKind::None => 6,
+        RepKind::None => 6,
     }
 }
 

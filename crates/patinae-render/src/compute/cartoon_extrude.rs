@@ -7,10 +7,11 @@
 //!                                  vertex range, body_end, flags)`
 //!   - `ExtrudeParams`     uniform : counts + tube profile `quality`
 //!
-//! Output: `StdVertex[]` storage+vertex buffer, exactly `total_vertices`
-//! entries, each one written by exactly one thread.
+//! Output: the backbone prefix of a shared `StdVertex[]` storage+vertex
+//! buffer, exactly `backbone_vertex_count` entries, each one written by
+//! exactly one thread. CPU-authored nucleotide geometry may follow the prefix.
 //!
-//! Dispatch: 1D, `(total_vertices + 63) / 64` workgroups of 64 threads.
+//! Dispatch: 1D, `(backbone_vertex_count + 63) / 64` workgroups of 64 threads.
 //! Each thread looks up its run via a linear scan over `runs[]` (n_runs
 //! is < 100 typically) and emits the right vertex per the per-CartoonType
 //! emission rules.
@@ -55,15 +56,19 @@ pub struct ExtrudeParams {
     pub loop_radius: f32,
     /// Multiplier on `sheet_height` for the arrow-head barb width.
     pub arrow_tip_scale: f32,
+    /// Exact writable backbone prefix length. The final rounded-up workgroup
+    /// must not overwrite CPU-authored nucleotide vertices that follow it.
+    pub backbone_vertex_count: u32,
     /// Padding to keep `size_of::<ExtrudeParams>()` a multiple of 16 B
     /// (WGSL uniform buffer requirement).
-    pub _pad0: u32,
     pub _pad1: u32,
 }
 
 impl ExtrudeParams {
     pub const SIZE: u64 = std::mem::size_of::<Self>() as u64;
 }
+
+const _: () = assert!(std::mem::size_of::<ExtrudeParams>() == 48);
 
 /// Mirrors `ExtrudePoint` in `cartoon_extrude.wgsl`. 32 B (vec3 +
 /// atom_idx, vec3 + pad).
@@ -201,9 +206,9 @@ impl CartoonExtrudeCompute {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         bind_group: &wgpu::BindGroup,
-        total_vertices: u32,
+        backbone_vertex_count: u32,
     ) {
-        let groups = total_vertices.div_ceil(WORKGROUP);
+        let groups = backbone_vertex_count.div_ceil(WORKGROUP);
         let (wg_x, wg_y) = super::split_1d_dispatch(groups);
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("patinae.cartoon_extrude.dispatch"),
@@ -212,5 +217,22 @@ impl CartoonExtrudeCompute {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, bind_group, &[]);
         pass.dispatch_workgroups(wg_x, wg_y, 1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rounded_dispatch_is_guarded_by_exact_backbone_prefix() {
+        let backbone_vertex_count = WORKGROUP + 1;
+        let dispatched_lanes = backbone_vertex_count.div_ceil(WORKGROUP) * WORKGROUP;
+
+        assert!(dispatched_lanes > backbone_vertex_count);
+        assert!(shader_source::CARTOON_EXTRUDE_WGSL
+            .contains("if (out_idx >= params.backbone_vertex_count)"));
+        assert!(!shader_source::CARTOON_EXTRUDE_WGSL
+            .contains("let total_verts = arrayLength(&vertices);"));
     }
 }

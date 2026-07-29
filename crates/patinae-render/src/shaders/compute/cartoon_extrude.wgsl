@@ -48,7 +48,9 @@ struct ExtrudeParams {
     sheet_height: f32,
     loop_radius: f32,
     arrow_tip_scale: f32,
-    _pad0: u32,
+    // Exact GPU-authored prefix. The same buffer may have CPU-authored
+    // nucleotide vertices immediately after this range.
+    backbone_vertex_count: u32,
     _pad1: u32,
 };
 
@@ -488,10 +490,9 @@ fn cs_main(
     @builtin(global_invocation_id) gid: vec3<u32>,
     @builtin(num_workgroups) nwg: vec3<u32>,
 ) {
-    // 2D dispatch handles total_verts > 65535*64.
+    // 2D dispatch handles backbone_vertex_count > 65535*64.
     let out_idx = gid.x + gid.y * nwg.x * 64u;
-    let total_verts = arrayLength(&vertices);
-    if (out_idx >= total_verts) {
+    if (out_idx >= params.backbone_vertex_count) {
         return;
     }
     let r = find_run_for_vertex(out_idx);

@@ -11,15 +11,15 @@
 //!   3. Host uploads ExtrudePoints + RunDescriptors to GPU storage buffers.
 //!   4. GPU `cartoon_extrude.wgsl` reads both, branches on
 //!      `RunDescriptor.car_type`, emits per-CartoonType geometry into the
-//!      vertex buffer.
-//!   5. Host issues a single `draw_indirect` against the result.
+//!      vertex-buffer prefix. For cartoons, the CPU appends connected
+//!      nucleotide rung + plate geometry to the same buffer.
+//!   5. Host issues one `draw_indirect` across the combined vertex range.
 //!
-//! All vertex emission is on GPU. Orient + sample interpolation runs on
-//! CPU because the algorithm is intrinsically sequential (greedy
-//! alt-sign, sliding-window helix axis, per-pair refine) and small-N
-//! (< few hundred residues per typical structure) — GPU dispatch
-//! overhead exceeds the compute savings here. Vertex emission is the
-//! GPU-worthy parallel work.
+//! Backbone vertex emission is on GPU. Orient + sample interpolation and the
+//! small fixed-size nucleotide accents run on CPU because both are
+//! intrinsically residue-local or sequential and small-N (< few hundred
+//! residues per typical structure). GPU dispatch remains focused on the
+//! high-volume extrusion work.
 //!
 //! ## SceneStore Integration
 //!
@@ -34,7 +34,7 @@
 
 pub mod backbone;
 pub mod frame;
-pub mod ladder;
+mod nucleic;
 pub mod tessellation;
 pub mod utils;
 
@@ -50,10 +50,14 @@ use crate::pipelines::cartoon::{CartoonParams, CartoonParamsLayout};
 use crate::render_input::RenderObjectInput;
 use crate::representation_budget::{RepMemoryEstimate, RepQualityLevel};
 use crate::representations::cartoon::backbone::{extract_retained_backbone, BackboneAtom};
+use crate::representations::cartoon::nucleic::{
+    count_nucleic_residues, prepare_nucleic_geometry, MAX_VERTICES_PER_NUCLEOTIDE,
+};
 use crate::representations::cartoon::tessellation::{
     from_resolved_settings, process_segment, segments_from_backbone_atoms, BackboneSegment,
     ExtrudePoint, GeomSettings, PipelineOutput, PipelineSettings, RunDescriptor,
 };
+use crate::representations::mesh::StdVertex;
 use crate::representations::{BuildCtx, Representation};
 use patinae_mol::DirtyFlags;
 
@@ -83,8 +87,31 @@ struct CartoonEstimateBufferBytes {
     capacity: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CartoonVertexLayout {
+    backbone_vertex_count: u32,
+    total_vertex_count: u32,
+    nucleic_byte_offset: u64,
+    total_vertex_bytes: u64,
+}
+
+fn cartoon_vertex_layout(
+    backbone_vertex_count: u32,
+    nucleic_vertex_count: usize,
+) -> Option<CartoonVertexLayout> {
+    let nucleic_vertex_count = u32::try_from(nucleic_vertex_count).ok()?;
+    let total_vertex_count = backbone_vertex_count.checked_add(nucleic_vertex_count)?;
+    Some(CartoonVertexLayout {
+        backbone_vertex_count,
+        total_vertex_count,
+        nucleic_byte_offset: u64::from(backbone_vertex_count) * StdVertex::SIZE,
+        total_vertex_bytes: u64::from(total_vertex_count) * StdVertex::SIZE,
+    })
+}
+
 fn cartoon_estimate_buffer_bytes(
     backbone_len: usize,
+    nucleic_residue_count: usize,
     sampling_rate: u32,
     quality_factor: u32,
 ) -> CartoonEstimateBufferBytes {
@@ -99,10 +126,13 @@ fn cartoon_estimate_buffer_bytes(
 
     let sample_count = (backbone_len as u64).saturating_mul(u64::from(sampling_rate.max(1)));
     let quality = u64::from(quality_factor.max(4));
-    let vertex_count = sample_count.saturating_mul(quality).saturating_mul(6);
+    let backbone_vertex_count = sample_count.saturating_mul(quality).saturating_mul(6);
+    let nucleic_vertex_count =
+        (nucleic_residue_count as u64).saturating_mul(MAX_VERTICES_PER_NUCLEOTIDE);
+    let vertex_count = backbone_vertex_count.saturating_add(nucleic_vertex_count);
     let extrude_points = sample_count.saturating_mul(ExtrudePointGpu::SIZE);
     let runs = sample_count.saturating_mul(std::mem::size_of::<RunDescriptor>() as u64);
-    let vertices = vertex_count.saturating_mul(24);
+    let vertices = vertex_count.saturating_mul(StdVertex::SIZE);
     let capacity = CartoonParams::SIZE
         .saturating_add(ExtrudeParams::SIZE)
         .saturating_add(extrude_points)
@@ -121,8 +151,8 @@ fn cartoon_estimate_buffer_bytes(
 /// Lazy-allocated GPU resources for one rebuild. Buffers are reused
 /// across rebuilds when capacity permits.
 struct CartoonResources {
-    /// Vertex count this build emitted (= sum of `RunDescriptor.vertex_count`).
-    vertex_count: u32,
+    /// Vertex count emitted by compute before the CPU nucleotide tail.
+    backbone_vertex_count: u32,
     params_buf: wgpu::Buffer,
     extrude_points_buf: wgpu::Buffer,
     runs_buf: wgpu::Buffer,
@@ -137,6 +167,7 @@ struct BuildSignature {
     /// Hash of CPU geometry inputs. Recolour / transparency-only changes do NOT bump this.
     geom_hash: u64,
     coord_hash: u64,
+    nucleic_hash: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,6 +188,10 @@ impl CartoonMode {
             CartoonMode::Ribbon => RepKind::Ribbon,
         }
     }
+}
+
+fn nucleic_geometry_enabled(mode: CartoonMode, settings: &ResolvedSettings) -> bool {
+    mode == CartoonMode::Cartoon && settings.cartoon.nucleic_ladder
 }
 
 pub struct CartoonRep {
@@ -256,6 +291,34 @@ mod tests {
             };
         }
         hash_cartoon_geometry(mode, &pipeline, &geom)
+    }
+
+    #[test]
+    fn integrated_nucleotide_geometry_is_enabled_by_default() {
+        assert!(Settings::default().cartoon.nucleic_ladder);
+    }
+
+    #[test]
+    fn cartoon_mode_enables_requested_nucleotide_geometry() {
+        let resolved = ResolvedSettings::resolve(&Settings::default(), None);
+
+        assert!(nucleic_geometry_enabled(CartoonMode::Cartoon, &resolved));
+    }
+
+    #[test]
+    fn cartoon_mode_honors_disabled_nucleotide_geometry() {
+        let mut settings = Settings::default();
+        settings.cartoon.nucleic_ladder = false;
+        let resolved = ResolvedSettings::resolve(&settings, None);
+
+        assert!(!nucleic_geometry_enabled(CartoonMode::Cartoon, &resolved));
+    }
+
+    #[test]
+    fn ribbon_mode_never_enables_nucleotide_geometry() {
+        let resolved = ResolvedSettings::resolve(&Settings::default(), None);
+
+        assert!(!nucleic_geometry_enabled(CartoonMode::Ribbon, &resolved));
     }
 
     fn synthetic_segment(segment_id: u32, len: usize) -> BackboneSegment {
@@ -414,10 +477,11 @@ mod tests {
 
     #[test]
     fn cartoon_estimate_buffer_bytes_is_monotonic() {
-        let base = cartoon_estimate_buffer_bytes(100, 7, 32);
-        assert!(cartoon_estimate_buffer_bytes(101, 7, 32).capacity >= base.capacity);
-        assert!(cartoon_estimate_buffer_bytes(100, 8, 32).capacity >= base.capacity);
-        assert!(cartoon_estimate_buffer_bytes(100, 7, 33).capacity >= base.capacity);
+        let base = cartoon_estimate_buffer_bytes(100, 10, 7, 32);
+        assert!(cartoon_estimate_buffer_bytes(101, 10, 7, 32).capacity >= base.capacity);
+        assert!(cartoon_estimate_buffer_bytes(100, 11, 7, 32).capacity >= base.capacity);
+        assert!(cartoon_estimate_buffer_bytes(100, 10, 8, 32).capacity >= base.capacity);
+        assert!(cartoon_estimate_buffer_bytes(100, 10, 7, 33).capacity >= base.capacity);
     }
 
     #[test]
@@ -427,7 +491,8 @@ mod tests {
         let segments: Vec<_> = (0..4).map(|id| synthetic_segment(id, 12)).collect();
         let backbone_len = segments.iter().map(BackboneSegment::len).sum::<usize>();
         let output = process_cartoon_segments(segments, backbone_len, &pipeline, &geom);
-        let estimate = cartoon_estimate_buffer_bytes(backbone_len, pipeline.sampling, geom.quality);
+        let estimate =
+            cartoon_estimate_buffer_bytes(backbone_len, 0, pipeline.sampling, geom.quality);
 
         assert!(
             estimate.extrude_points >= output.extrude_points.len() as u64 * ExtrudePointGpu::SIZE
@@ -435,7 +500,35 @@ mod tests {
         assert!(
             estimate.runs >= output.runs.len() as u64 * std::mem::size_of::<RunDescriptor>() as u64
         );
-        assert!(estimate.vertices >= output.total_vertices as u64 * 24);
+        assert!(estimate.vertices >= output.total_vertices as u64 * StdVertex::SIZE);
+    }
+
+    #[test]
+    fn cartoon_estimate_includes_integrated_nucleotide_geometry() {
+        let without_nucleotides = cartoon_estimate_buffer_bytes(100, 0, 7, 32);
+        let with_nucleotides = cartoon_estimate_buffer_bytes(100, 3, 7, 32);
+
+        assert_eq!(
+            with_nucleotides.vertices - without_nucleotides.vertices,
+            3 * MAX_VERTICES_PER_NUCLEOTIDE * StdVertex::SIZE
+        );
+    }
+
+    #[test]
+    fn cartoon_vertex_layout_keeps_compute_prefix_separate_from_draw_total() {
+        let layout = cartoon_vertex_layout(600, MAX_VERTICES_PER_NUCLEOTIDE as usize)
+            .expect("representable layout");
+
+        assert_eq!(layout.backbone_vertex_count, 600);
+        assert_eq!(
+            layout.total_vertex_count,
+            600 + MAX_VERTICES_PER_NUCLEOTIDE as u32
+        );
+        assert_eq!(layout.nucleic_byte_offset, 600 * StdVertex::SIZE);
+        assert_eq!(
+            layout.total_vertex_bytes,
+            u64::from(layout.total_vertex_count) * StdVertex::SIZE
+        );
     }
 }
 
@@ -695,10 +788,17 @@ impl Representation for CartoonRep {
         }
         let coord_hash = hash_backbone(&bb);
         let geom_hash = hash_cartoon_geometry(self.mode, &pipeline_settings, &geom_settings);
+        let nucleic_geometry = prepare_nucleic_geometry(
+            input.molecule,
+            input.coord_set,
+            &bb,
+            nucleic_geometry_enabled(self.mode, s),
+        );
         let sig = BuildSignature {
             n_atoms,
             geom_hash,
             coord_hash,
+            nucleic_hash: nucleic_geometry.signature,
         };
         if self.last_build == Some(sig) {
             return;
@@ -714,6 +814,22 @@ impl Representation for CartoonRep {
             self.needs_dispatch = false;
             return;
         }
+        let nucleic_vertices = nucleic_geometry.emit_vertices();
+        let Some(vertex_layout) =
+            cartoon_vertex_layout(output.total_vertices, nucleic_vertices.len())
+        else {
+            log::warn!(
+                "patinae-render: combined cartoon geometry exceeds the u32 draw limit - \
+                 skipping cartoon for this object"
+            );
+            self.resources = None;
+            self.vertex_count = 0;
+            self.needs_dispatch = false;
+            return;
+        };
+        let backbone_vertex_count = vertex_layout.backbone_vertex_count;
+        let total_vertices = vertex_layout.total_vertex_count;
+        let vertex_bytes = vertex_layout.total_vertex_bytes;
 
         // ────── Host upload: convert to GPU types + upload ──────
         let extrude_points_gpu: Vec<ExtrudePointGpu> = output
@@ -738,11 +854,9 @@ impl Representation for CartoonRep {
             sheet_height: geom_settings.sheet_height,
             loop_radius: geom_settings.loop_radius,
             arrow_tip_scale: geom_settings.arrow_tip_scale,
-            _pad0: 0,
+            backbone_vertex_count,
             _pad1: 0,
         };
-        let total_vertices = output.total_vertices;
-        let vertex_bytes = (total_vertices as u64) * 24;
         let extrude_points_bytes = (extrude_points_gpu.len() as u64) * ExtrudePointGpu::SIZE;
         let runs_bytes = (output.runs.len() as u64) * std::mem::size_of::<RunDescriptor>() as u64;
         let storage_buffer_limit = cartoon_storage_buffer_limit(device.limits());
@@ -815,7 +929,7 @@ impl Representation for CartoonRep {
             // Bind group will be (re)built in `dispatch_compute_build`
             // against the shared compute pipeline.
             self.resources = Some(CartoonResources {
-                vertex_count: total_vertices,
+                backbone_vertex_count,
                 params_buf,
                 extrude_points_buf,
                 runs_buf,
@@ -845,11 +959,23 @@ impl Representation for CartoonRep {
                 0,
                 bytemuck::cast_slice(&[total_vertices, 1u32, 0u32, 0u32]),
             );
-            r.vertex_count = total_vertices;
+            r.backbone_vertex_count = backbone_vertex_count;
+        }
+
+        if !nucleic_vertices.is_empty() {
+            let r = self
+                .resources
+                .as_ref()
+                .expect("cartoon resources allocated");
+            queue.write_buffer(
+                &r.vertex_buf,
+                vertex_layout.nucleic_byte_offset,
+                bytemuck::cast_slice(&nucleic_vertices),
+            );
         }
 
         self.vertex_count = total_vertices;
-        self.needs_dispatch = true;
+        self.needs_dispatch = backbone_vertex_count > 0;
     }
 
     fn is_opaque(&self) -> bool {
@@ -914,7 +1040,7 @@ impl Representation for CartoonRep {
                 return false;
             }
         };
-        if r.vertex_count == 0 {
+        if r.backbone_vertex_count == 0 {
             self.needs_dispatch = false;
             return false;
         }
@@ -930,7 +1056,7 @@ impl Representation for CartoonRep {
             &r.runs_buf,
             &r.vertex_buf,
         );
-        compute_pipeline.dispatch(ctx.encoder, &r.extrude_bg, r.vertex_count);
+        compute_pipeline.dispatch(ctx.encoder, &r.extrude_bg, r.backbone_vertex_count);
         self.needs_dispatch = false;
         true
     }
@@ -981,8 +1107,17 @@ fn cartoon_estimate(
             0.3
         };
     }
-    let buffers =
-        cartoon_estimate_buffer_bytes(bb.len(), pipeline_settings.sampling, geom_settings.quality);
+    let nucleic_residue_count = if nucleic_geometry_enabled(mode, settings) {
+        count_nucleic_residues(&bb)
+    } else {
+        0
+    };
+    let buffers = cartoon_estimate_buffer_bytes(
+        bb.len(),
+        nucleic_residue_count,
+        pipeline_settings.sampling,
+        geom_settings.quality,
+    );
 
     RepMemoryEstimate {
         required_bytes: buffers

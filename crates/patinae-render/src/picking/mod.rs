@@ -81,10 +81,6 @@ pub enum RepKind {
     Surface = 7,
     Ribbon = 8,
     Ellipsoid = 9,
-    /// Base-pair "rung" geometry for nucleic acid cartoons. Reuses the
-    /// stick capsule pipeline (`geometry.stick_pipeline`) rather than
-    /// owning a dedicated one; not pickable, not shadow-casting.
-    NucleicLadder = 10,
 }
 
 impl RepKind {
@@ -103,7 +99,6 @@ impl RepKind {
             7 => RepKind::Surface,
             8 => RepKind::Ribbon,
             9 => RepKind::Ellipsoid,
-            10 => RepKind::NucleicLadder,
             _ => RepKind::None,
         }
     }
@@ -214,5 +209,10 @@ mod tests {
         let id = PackedId::pack(RepKind::Sphere, ObjectId(0x1003), 0);
         let (_, obj, _) = id.unpack().unwrap();
         assert_eq!(obj, ObjectId(0x003));
+    }
+
+    #[test]
+    fn removed_nucleic_ladder_raw_id_decodes_as_none() {
+        assert_eq!(RepKind::from_raw(10), RepKind::None);
     }
 }
