@@ -19,6 +19,7 @@
 //! `POST /v1/messages` and decodes the SSE stream by hand.
 
 pub mod api;
+pub mod auth;
 
 use patinae_plugin::patinae_plugin;
 use patinae_plugin::prelude::*;
