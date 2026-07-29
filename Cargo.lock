@@ -847,6 +847,7 @@ dependencies = [
  "log",
  "patinae-framework",
  "patinae-plugin",
+ "patinae-plugin-host",
  "patinae-scene",
  "patinae-settings",
  "reqwest",

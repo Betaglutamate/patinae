@@ -312,6 +312,7 @@ Plugins are compiled as dynamic libraries (`.dylib` on macOS, `.so` on Linux,
 | **raytracer** | `raytracer-plugin` | GPU ray tracing with BVH acceleration, shadows, transparency, and edge detection |
 | **ipc** | `ipc-plugin` | Inter-process communication plugin for external tool integration |
 | **python** | `python-plugin` | Embedded CPython interpreter for scripting inside the native app |
+| **claude** | `claude-plugin` | Claude AI agent that drives the viewer from natural language |
 
 Build and stage the reference plugins:
 
@@ -334,6 +335,35 @@ make plugins-install
 The `python-plugin` embeds CPython directly into the native application. It is
 separate from the standalone Python package: scripts run inside the desktop app
 and issue commands through the same dispatcher as native commands.
+
+### Claude Plugin
+
+The `claude-plugin` puts a Claude agent inside the viewer. Ask for something in
+the Claude panel (bottom dock) or with the `claude` command, and it drives the
+scene itself: running commands, reading loaded structures and sequences, and
+taking screenshots to check its own work.
+
+```text
+claude load 1crn and show it as cartoon coloured by chain
+claude what chains are in this structure and how long are they?
+```
+
+Sign-in is brokered through Anthropic's [`ant` CLI](https://platform.claude.com/docs/en/api/sdks/cli),
+which owns the OAuth flow and token refresh — the plugin stores no credential
+of its own. Install `ant`, then use **Sign in** in the panel.
+
+Tool calls that change the scene require approval before they run. Set
+`claude_auto_approve, on` to skip the prompt for commands; Python always
+prompts, because it executes in the viewer's own process.
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `claude_model` | `claude-opus-5` | Model to use |
+| `claude_effort` | `xhigh` | Reasoning effort: `low`…`max` |
+| `claude_max_tokens` | `64000` | Response cap |
+| `claude_auto_approve` | `off` | Run scene commands without prompting |
+| `claude_allow_python` | `on` | Offer the Python tool at all |
+| `claude_capture_width` / `_height` | `1024` / `768` | Screenshot size |
 
 ## License
 

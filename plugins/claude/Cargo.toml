@@ -38,5 +38,9 @@ serde_json = { workspace = true }
 base64 = "0.22"
 log = { workspace = true }
 
+[dev-dependencies]
+# Validates that the exported declaration is one this host would accept.
+patinae-plugin-host = { path = "../../crates/patinae-plugin-host" }
+
 [lints]
 workspace = true
