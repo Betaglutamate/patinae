@@ -312,7 +312,7 @@ Plugins are compiled as dynamic libraries (`.dylib` on macOS, `.so` on Linux,
 | **raytracer** | `raytracer-plugin` | GPU ray tracing with BVH acceleration, shadows, transparency, and edge detection |
 | **ipc** | `ipc-plugin` | Inter-process communication plugin for external tool integration |
 | **python** | `python-plugin` | Embedded CPython interpreter for scripting inside the native app |
-| **claude** | `claude-plugin` | Claude AI agent that drives the viewer from natural language |
+| **ai** | `ai-plugin` | AI agent (Claude or Gemini) that drives the viewer from natural language |
 
 Build and stage the reference plugins:
 

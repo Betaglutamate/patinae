@@ -20,8 +20,8 @@ use base64::Engine as _;
 use patinae_plugin::prelude::*;
 use serde_json::Value;
 
-use crate::api::types::ToolResultContent;
 use crate::prompt;
+use crate::provider::Part;
 use crate::settings;
 use crate::state::{Entry, Pending, Shared};
 use crate::tools;
@@ -41,8 +41,8 @@ struct Gated {
 pub struct ClaudeHandler {
     worker: WorkerHandle,
     state: Shared,
-    /// host execution id -> Claude tool-call id
-    pending_execs: HashMap<u64, String>,
+    /// host execution id -> (tool-call id, tool name)
+    pending_execs: HashMap<u64, (String, String)>,
     /// Approval queue; the front entry is the one shown in the panel.
     gated: VecDeque<Gated>,
     /// Config last pushed to the worker, so settings changes are detected
@@ -76,16 +76,20 @@ impl ClaudeHandler {
     }
 
     /// Post a tool result back to the worker.
-    fn reply(&self, call_id: &str, content: Vec<ToolResultContent>, is_error: bool) {
+    ///
+    /// The tool name travels with the result because Gemini's
+    /// `functionResponse` requires it; Anthropic pairs by id alone.
+    fn reply(&self, call_id: &str, name: &str, content: Vec<Part>, is_error: bool) {
         self.send_worker(ToWorker::ToolResult {
             call_id: call_id.to_string(),
+            name: name.to_string(),
             content,
             is_error,
         });
     }
 
-    fn reply_text(&self, call_id: &str, text: impl Into<String>, is_error: bool) {
-        self.reply(call_id, vec![ToolResultContent::text(text)], is_error);
+    fn reply_text(&self, call_id: &str, name: &str, text: impl Into<String>, is_error: bool) {
+        self.reply(call_id, name, vec![Part::text(text)], is_error);
     }
 
     // --- settings -------------------------------------------------------
@@ -99,9 +103,18 @@ impl ClaudeHandler {
             self.prompt_ready = true;
         }
 
-        let config = settings::read_config(ctx.shared, system_prompt);
+        let id = settings::provider(ctx.shared);
+        let config = crate::worker::Config {
+            provider: id,
+            model: settings::model(ctx.shared, id),
+            effort: settings::effort(ctx.shared),
+            max_tokens: settings::max_tokens(ctx.shared),
+            allow_python: settings::allow_python(ctx.shared),
+            system_prompt,
+        };
         let fingerprint = format!(
-            "{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}",
+            config.provider.as_str(),
             config.model,
             config.effort,
             config.max_tokens,
@@ -169,13 +182,14 @@ impl ClaudeHandler {
 
         if allow {
             self.note(format!("{} → {}", gate.name, gate.command));
-            self.run_command_tool(ctx, &gate.call_id, &gate.command);
+            self.run_command_tool(ctx, &gate.call_id, &gate.name, &gate.command);
         } else {
             self.note(format!("Denied: {}", gate.command));
             // An explicit error result lets Claude adapt; silently dropping the
             // call would strand the turn waiting forever.
             self.reply_text(
                 &gate.call_id,
+                &gate.name,
                 "The user denied this tool call. Do not retry it; explain what you \
                  wanted to do and ask how they would like to proceed.",
                 true,
@@ -249,7 +263,7 @@ impl ClaudeHandler {
             let always_ask = name == tools::RUN_PYTHON;
             if auto && !always_ask {
                 self.note(format!("{name} → {command}"));
-                self.run_command_tool(ctx, call_id, &command);
+                self.run_command_tool(ctx, call_id, name, &command);
             } else {
                 self.gated.push_back(Gated {
                     call_id: call_id.to_string(),
@@ -265,6 +279,7 @@ impl ClaudeHandler {
             // A mutating tool with no command form means a malformed input.
             self.reply_text(
                 call_id,
+                name,
                 format!("`{name}` was called without its required argument."),
                 true,
             );
@@ -272,8 +287,8 @@ impl ClaudeHandler {
         }
 
         match name {
-            tools::SCREENSHOT => self.run_screenshot(ctx, call_id, input),
-            tools::GET_SCENE_STATE => self.run_read(ctx, call_id, |v| tools::scene_state(v)),
+            tools::SCREENSHOT => self.run_screenshot(ctx, call_id, name, input),
+            tools::GET_SCENE_STATE => self.run_read(ctx, call_id, name, tools::scene_state),
             tools::COUNT_ATOMS => {
                 let expr = input
                     .get("selection")
@@ -281,9 +296,9 @@ impl ClaudeHandler {
                     .unwrap_or_default()
                     .to_string();
                 if expr.trim().is_empty() {
-                    self.reply_text(call_id, "`count_atoms` requires a `selection`.", true);
+                    self.reply_text(call_id, name, "`count_atoms` requires a `selection`.", true);
                 } else {
-                    self.run_read(ctx, call_id, move |v| tools::count_atoms(v, &expr));
+                    self.run_read(ctx, call_id, name, move |v| tools::count_atoms(v, &expr));
                 }
             }
             tools::GET_SEQUENCES => {
@@ -295,34 +310,43 @@ impl ClaudeHandler {
                     .get("chain")
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
-                self.run_read(ctx, call_id, move |v| {
+                self.run_read(ctx, call_id, name, move |v| {
                     tools::sequences(v, object.as_deref(), chain.as_deref())
                 });
             }
-            other => self.reply_text(call_id, format!("Unknown tool `{other}`."), true),
+            other => self.reply_text(call_id, other, format!("Unknown tool `{other}`."), true),
         }
     }
 
     /// Queue a command for the host executor and remember which tool call it
     /// belongs to; the result surfaces in a later poll.
-    fn run_command_tool(&mut self, ctx: &mut PollContext<'_>, call_id: &str, command: &str) {
+    fn run_command_tool(
+        &mut self,
+        ctx: &mut PollContext<'_>,
+        call_id: &str,
+        name: &str,
+        command: &str,
+    ) {
         let exec_id = NEXT_EXEC_ID.fetch_add(1, Ordering::SeqCst);
-        self.pending_execs.insert(exec_id, call_id.to_string());
+        self.pending_execs
+            .insert(exec_id, (call_id.to_string(), name.to_string()));
         ctx.execute_command(exec_id, command, true);
     }
 
     /// Run a read-only closure against the viewer on the main thread.
-    fn run_read<F>(&self, ctx: &mut PollContext<'_>, call_id: &str, read: F)
+    fn run_read<F>(&self, ctx: &mut PollContext<'_>, call_id: &str, name: &str, read: F)
     where
         F: FnOnce(&dyn ViewerLike) -> String + Send + 'static,
     {
         let tx = self.worker.tx.clone();
         let call_id = call_id.to_string();
+        let name = name.to_string();
         ctx.queue_viewer_mutation(move |viewer| {
             let text = read(viewer);
             let _ = tx.send(ToWorker::ToolResult {
                 call_id,
-                content: vec![ToolResultContent::text(text)],
+                name,
+                content: vec![Part::text(text)],
                 is_error: false,
             });
         });
@@ -333,7 +357,7 @@ impl ClaudeHandler {
     /// `capture_png` only writes to a path, so this round-trips through a temp
     /// file. The closure runs with a live render context because the host
     /// supplies one when applying plugin mutations.
-    fn run_screenshot(&self, ctx: &mut PollContext<'_>, call_id: &str, input: &Value) {
+    fn run_screenshot(&self, ctx: &mut PollContext<'_>, call_id: &str, name: &str, input: &Value) {
         let (default_w, default_h) = settings::capture_size(ctx.shared);
         let width = input
             .get("width")
@@ -348,6 +372,7 @@ impl ClaudeHandler {
 
         let tx = self.worker.tx.clone();
         let call_id = call_id.to_string();
+        let name = name.to_string();
         let path = std::env::temp_dir().join(format!("patinae-claude-{call_id}.png"));
 
         ctx.queue_viewer_mutation(move |viewer| {
@@ -358,18 +383,18 @@ impl ClaudeHandler {
                         let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
                         ToWorker::ToolResult {
                             call_id,
+                            name,
                             content: vec![
-                                ToolResultContent::text(format!(
-                                    "Viewport capture, {width}x{height}:"
-                                )),
-                                ToolResultContent::png(encoded),
+                                Part::text(format!("Viewport capture, {width}x{height}:")),
+                                Part::png(encoded),
                             ],
                             is_error: false,
                         }
                     }
                     Err(e) => ToWorker::ToolResult {
                         call_id,
-                        content: vec![ToolResultContent::text(format!(
+                        name,
+                        content: vec![Part::text(format!(
                             "Capture succeeded but the image could not be read back: {e}"
                         ))],
                         is_error: true,
@@ -377,7 +402,8 @@ impl ClaudeHandler {
                 },
                 Err(e) => ToWorker::ToolResult {
                     call_id,
-                    content: vec![ToolResultContent::text(format!("Screenshot failed: {e}"))],
+                    name,
+                    content: vec![Part::text(format!("Screenshot failed: {e}"))],
                     is_error: true,
                 },
             };
@@ -389,12 +415,14 @@ impl ClaudeHandler {
     /// Pair completed host command executions back to their tool calls.
     fn drain_command_results(&mut self, ctx: &mut PollContext<'_>) {
         for result in ctx.command_results {
-            let Some(call_id) = self.pending_execs.remove(&result.id) else {
+            let Some((call_id, name)) = self.pending_execs.remove(&result.id) else {
                 continue;
             };
             match &result.result {
-                Ok(()) => self.reply_text(&call_id, "Command completed successfully.", false),
-                Err(e) => self.reply_text(&call_id, format!("Command failed: {e}"), true),
+                Ok(()) => {
+                    self.reply_text(&call_id, &name, "Command completed successfully.", false)
+                }
+                Err(e) => self.reply_text(&call_id, &name, format!("Command failed: {e}"), true),
             }
         }
     }

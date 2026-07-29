@@ -10,7 +10,7 @@ use patinae_plugin::prelude::*;
 
 use crate::state::{Entry, Shared, SharedState};
 
-const PANEL_ID: &str = "claude_chat";
+const PANEL_ID: &str = "ai_chat";
 
 // Control ids, also used to route events back.
 const STATUS: &str = "status";
@@ -65,7 +65,7 @@ fn speaker_highlights(state: &SharedState) -> Vec<PanelTextHighlight> {
 
 impl PluginPanel for ChatPanel {
     fn descriptor(&self) -> PanelDescriptor {
-        PanelDescriptor::bottom(PANEL_ID, "Claude")
+        PanelDescriptor::bottom(PANEL_ID, "AI")
             .icon("AI")
             .default_visible(false)
     }
@@ -81,7 +81,7 @@ impl PluginPanel for ChatPanel {
             Ok(state) => build_snapshot(&state),
             Err(_) => PanelSnapshot::new(vec![PanelControl::Text {
                 id: STATUS.into(),
-                text: "Claude panel state is unavailable.".into(),
+                text: "AI panel state is unavailable.".into(),
             }]),
         }
     }
@@ -154,7 +154,7 @@ fn build_snapshot(state: &SharedState) -> PanelSnapshot {
             id: PROMPT_INPUT.into(),
             label: "".into(),
             value: state.input.clone(),
-            placeholder: "Ask Claude to do something…".into(),
+            placeholder: "Ask the agent to do something…".into(),
         });
         controls.push(PanelControl::ButtonRow {
             id: ACTIONS.into(),
