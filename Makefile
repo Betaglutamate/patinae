@@ -52,7 +52,7 @@ WINDOWS_LAUNCHER := windows/$(APP_NAME).vbs
 
 PYTHON_VERSION := 3.13
 PYTHON_VENV    := $(APP_ROOT)/python-venv
-WHEEL_GLOB     := python/target/wheels/patinae-*.whl
+WHEEL_GLOB     := python/target/wheels/patinae-$(VERSION)-*.whl
 ENV_FILE       := .env
 
 PLUGIN_INSTALL_DIR ?= $(HOME)/.patinae/plugins
