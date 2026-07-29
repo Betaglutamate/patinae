@@ -41,6 +41,7 @@ impl ParsedModel {
     }
 }
 
+// File-level atom serials are metadata and may continue across compatible models.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct AtomIdentity {
     name: String,
@@ -51,7 +52,6 @@ struct AtomIdentity {
     icode: char,
     alt: char,
     hetatm: bool,
-    serial: Option<i32>,
     formal_charge: Option<i8>,
 }
 
@@ -66,7 +66,6 @@ impl From<&ParsedAtom> for AtomIdentity {
             icode: atom.icode,
             alt: atom.alt,
             hetatm: atom.hetatm,
-            serial: atom.serial,
             formal_charge: atom.formal_charge,
         }
     }

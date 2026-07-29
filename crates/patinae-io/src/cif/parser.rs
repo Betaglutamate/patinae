@@ -1027,8 +1027,8 @@ _atom_site.Cartn_z
 _atom_site.pdbx_PDB_model_num
 1 N N ALA A 1 0.0 0.0 0.0 1
 2 C CA ALA A 1 1.0 0.0 0.0 1
-1 N N ALA A 1 0.5 0.0 0.0 2
-2 C CA ALA A 1 1.5 0.0 0.0 2
+3 N N ALA A 1 0.5 0.0 0.0 2
+4 C CA ALA A 1 1.5 0.0 0.0 2
 "#;
 
         let mut reader = CifReader::new(cif_data.as_bytes());
@@ -1037,6 +1037,8 @@ _atom_site.pdbx_PDB_model_num
         assert_eq!(molecules.len(), 1);
         assert_eq!(molecules[0].atom_count(), 2);
         assert_eq!(molecules[0].state_count(), 2);
+        assert_eq!(molecules[0].atoms_slice()[0].id, 1);
+        assert_eq!(molecules[0].atoms_slice()[1].id, 2);
     }
 
     #[test]
