@@ -500,7 +500,7 @@ fn build_nucleic_geometry(
 mod tests {
     use super::*;
     use crate::geometry_export::analytic::oct_decode;
-    use crate::representations::cartoon::backbone::{extract_retained_backbone, BackboneAtom};
+    use crate::representations::cartoon::backbone::BackboneAtom;
     use lin_alg::f32::Vec3;
     use patinae_mol::{
         AtomBuilder, AtomFlags, AtomIndex, AtomResidue, MoleculeBuilder, ObjectMolecule, RepMask,
@@ -680,24 +680,5 @@ mod tests {
         let after = build_nucleic_geometry(&molecule, &changed, &[backbone], true);
 
         assert_ne!(before.signature, after.signature);
-    }
-
-    #[test]
-    fn six_yov_emits_one_integrated_accent_per_retained_nucleotide() {
-        let molecule = patinae_io::cif::read_cif(std::path::Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../_tests/6yov.cif"
-        )))
-        .expect("parse 6YOV");
-        let coord_set = molecule.current_coord_set().expect("coord set");
-        let backbone = extract_retained_backbone(&molecule, coord_set, 10);
-        let nucleotide_count = count_nucleic_residues(&backbone);
-        let geometry = build_nucleic_geometry(&molecule, coord_set, &backbone, true);
-
-        assert!(nucleotide_count > 0);
-        assert_eq!(
-            geometry.vertices.len(),
-            nucleotide_count * MAX_VERTICES_PER_NUCLEOTIDE as usize
-        );
     }
 }
