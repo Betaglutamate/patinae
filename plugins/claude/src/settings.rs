@@ -21,7 +21,7 @@ pub const ALLOW_PYTHON: &str = "claude_allow_python";
 pub const CAPTURE_WIDTH: &str = "claude_capture_width";
 pub const CAPTURE_HEIGHT: &str = "claude_capture_height";
 
-pub const DEFAULT_EFFORT: &str = "xhigh";
+pub const DEFAULT_EFFORT: &str = "medium";
 pub const DEFAULT_MAX_TOKENS: i32 = 64_000;
 pub const DEFAULT_CAPTURE_WIDTH: i32 = 1024;
 pub const DEFAULT_CAPTURE_HEIGHT: i32 = 768;
@@ -126,12 +126,12 @@ mod tests {
     }
 
     #[test]
-    fn model_defaults_to_opus_5() {
+    fn model_defaults_to_sonnet_5() {
         let model = string_descriptors()
             .into_iter()
             .find(|d| d.name == MODEL)
             .expect("model descriptor");
-        assert_eq!(model.default, SettingValue::String("claude-opus-5".into()));
+        assert_eq!(model.default, SettingValue::String("claude-sonnet-5".into()));
     }
 
     #[test]
