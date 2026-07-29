@@ -147,7 +147,8 @@ polymer and not solvent
 - Electron density map loading and contouring.
 
 **Sessions:** save and load Patinae `.prs` sessions and import legacy `.pse`
-sessions for interoperability. Upgrade Patinae v0.4.0–v0.4.2 sessions with
+sessions for interoperability. Upgrade PyMOL-RS v0.3.3 or Patinae
+v0.4.0–v0.4.2 sessions with
 `cargo run -p prs-upgrade -- old.prs upgraded.prs`.
 
 **Ray tracing:** the `raytracer` plugin provides offline GPU ray tracing with

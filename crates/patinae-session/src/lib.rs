@@ -4,8 +4,9 @@ pub mod prs;
 pub mod pse;
 
 pub use convert::pse_to_session;
+#[doc(inline)]
 pub use prs::{
-    load_prs, load_prs_document, save_prs, PrsDocument, PRS_FORMAT_VERSION,
+    decode_prs_document, load_prs, load_prs_document, save_prs, PrsDocument, PRS_FORMAT_VERSION,
     PRS_LEGACY_FORMAT_VERSION, PRS_PRODUCER, PRS_PRODUCER_VERSION,
 };
 

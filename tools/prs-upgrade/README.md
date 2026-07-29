@@ -1,9 +1,9 @@
 # PRS Upgrade
 
 `prs-upgrade` converts legacy Patinae `.prs` sessions to the current PRS
-format. The first supported migration covers sessions written by Patinae
-v0.4.0 through v0.4.2, including both raw positional sessions and PRS v2
-documents written with named fields.
+format. Supported migrations cover raw positional sessions written by
+PyMOL-RS v0.3.3, plus Patinae v0.4.0 through v0.4.2 sessions in either raw
+positional or PRS v2 named-field form.
 
 Run it from the repository root:
 

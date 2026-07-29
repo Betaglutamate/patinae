@@ -108,10 +108,19 @@ pub fn load_prs(path: &Path) -> Result<Session, PrsError> {
 /// Load a `.prs` file together with PRS format and producer metadata.
 pub fn load_prs_document(path: &Path) -> Result<PrsDocument, PrsError> {
     let bytes = read_prs_bytes(path)?;
-    decode_prs_document(&bytes)
+    decode_prs_document(bytes)
 }
 
-fn decode_prs_document(bytes: &[u8]) -> Result<PrsDocument, PrsError> {
+/// Decode an uncompressed PRS document from MessagePack bytes.
+///
+/// Both current PRS envelopes and legacy raw [`Session`] payloads are accepted.
+///
+/// # Errors
+///
+/// Returns [`PrsError::Deserialize`] when the bytes contain neither a current
+/// PRS document nor a legacy raw session.
+pub fn decode_prs_document(bytes: impl AsRef<[u8]>) -> Result<PrsDocument, PrsError> {
+    let bytes = bytes.as_ref();
     match rmp_serde::from_slice::<PrsDocument>(bytes) {
         Ok(document) => Ok(document),
         Err(envelope_error) => match rmp_serde::from_slice::<Session>(bytes) {
@@ -291,6 +300,24 @@ mod tests {
             .any(|warning| warning.contains("legacy PRS session")));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn current_document_decodes_from_uncompressed_bytes() {
+        let session = cartoon_session_with_restore();
+        let document = PrsDocumentRef {
+            prs_format_version: PRS_FORMAT_VERSION,
+            producer: PRS_PRODUCER,
+            producer_version: PRS_PRODUCER_VERSION,
+            session: &session,
+        };
+        let data = rmp_serde::to_vec_named(&document).unwrap();
+
+        let decoded = decode_prs_document(data).unwrap();
+
+        assert_eq!(decoded.prs_format_version, PRS_FORMAT_VERSION);
+        assert_eq!(decoded.producer.as_deref(), Some(PRS_PRODUCER));
+        assert!(decoded.session.registry.get_molecule("mol").is_some());
     }
 
     #[test]

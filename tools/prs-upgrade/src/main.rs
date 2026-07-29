@@ -8,13 +8,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, ensure, Context, Result};
 use flate2::read::GzDecoder;
-use patinae_scene::Session;
+use patinae_scene::{ObjectState, Session};
 use patinae_session::prs::{
     load_prs_document, save_prs, PrsDocument, PRS_FORMAT_VERSION, PRS_PRODUCER_VERSION,
 };
 use patinae_settings::groups::{CartoonOverrides, CartoonSettings, Settings};
 use patinae_settings::ObjectOverrides;
 use rmpv::Value;
+use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 const HELP: &str = "\
@@ -24,19 +25,91 @@ Usage:
   prs-upgrade <input.prs> <output.prs>
 
 The output path must not exist. The input file is never modified.
-Supported legacy producers: Patinae v0.4.0 through v0.4.2.
+Supported legacy producers: PyMOL-RS v0.3.3 and Patinae v0.4.0 through v0.4.2.
 ";
 
 // Session stored `settings` as its seventh positional field before the PRS v2
 // envelope was introduced. Changing this index would target unrelated data.
 const SESSION_REGISTRY_INDEX: usize = 0;
+const SESSION_SCENES_INDEX: usize = 3;
 const SESSION_SETTINGS_INDEX: usize = 6;
+const SESSION_NAMED_PALETTE_INDEX: usize = 7;
+const SESSION_PALETTE_INDEX: usize = 8;
+const SESSION_CLEAR_COLOR_INDEX: usize = 9;
+const SESSION_CLEAR_COLOR_SET_INDEX: usize = 10;
+
+// PyMOL-RS v0.3.3 stored ElementColors and the unit ChainColors separately
+// before Patinae combined them into ThemedPalette.
+const V033_SESSION_ELEMENT_COLORS_INDEX: usize = 8;
+const V033_SESSION_CLEAR_COLOR_INDEX: usize = 10;
 
 // v0.4.0-v0.4.2 Settings had 15 positional groups. v0.4.3 inserted renderer
 // at index 3 and object at index 7, shifting all later fields.
 const LEGACY_SETTINGS_TO_CURRENT: [usize; 15] =
     [0, 1, 2, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16];
 const LEGACY_SETTINGS_CARTOON_INDEX: usize = 6;
+
+// PyMOL-RS v0.3.3 predates the FXAA, SSAO, renderer, object, and ellipsoid
+// groups. The remaining groups retain these semantic destinations.
+const V033_SETTINGS_TO_CURRENT: [usize; 12] = [0, 1, 2, 4, 8, 9, 10, 11, 12, 13, 14, 15];
+const V033_SETTINGS_UI_INDEX: usize = 1;
+const V033_SETTINGS_CARTOON_INDEX: usize = 4;
+const V033_SETTINGS_STICK_INDEX: usize = 5;
+const V033_SETTINGS_SPHERE_INDEX: usize = 6;
+const V033_SETTINGS_SURFACE_INDEX: usize = 7;
+const V033_SETTINGS_DOT_INDEX: usize = 10;
+const V033_SETTINGS_MESH_INDEX: usize = 11;
+
+const CURRENT_SETTINGS_UI_INDEX: usize = 1;
+const CURRENT_SETTINGS_CARTOON_INDEX: usize = 8;
+const CURRENT_SETTINGS_STICK_INDEX: usize = 9;
+const CURRENT_SETTINGS_SPHERE_INDEX: usize = 10;
+const CURRENT_SETTINGS_SURFACE_INDEX: usize = 11;
+const CURRENT_SETTINGS_DOT_INDEX: usize = 14;
+const CURRENT_SETTINGS_MESH_INDEX: usize = 15;
+
+const V033_UI_TO_CURRENT: [Option<usize>; 10] = [
+    Some(1),
+    Some(2),
+    Some(3),
+    Some(4),
+    Some(5),
+    Some(6),
+    Some(7),
+    None,
+    None,
+    None,
+];
+const V033_CARTOON_TO_CURRENT: [Option<usize>; 15] = [
+    Some(0),
+    Some(1),
+    Some(2),
+    Some(3),
+    Some(4),
+    Some(5),
+    Some(6),
+    Some(7),
+    Some(9),
+    Some(10),
+    Some(11),
+    Some(12),
+    Some(13),
+    Some(14),
+    Some(15),
+];
+const V033_STICK_TO_CURRENT: [Option<usize>; 5] = [Some(0), Some(1), Some(2), Some(3), None];
+const V033_SPHERE_TO_CURRENT: [Option<usize>; 3] = [Some(0), None, Some(1)];
+const V033_SURFACE_TO_CURRENT: [Option<usize>; 7] = [
+    Some(0),
+    Some(9),
+    Some(2),
+    Some(3),
+    Some(6),
+    Some(7),
+    Some(8),
+];
+const V033_DOT_TO_CURRENT: [Option<usize>; 3] = [Some(1), Some(2), None];
+const V033_MESH_TO_CURRENT: [Option<usize>; 2] = [Some(0), None];
 
 // v0.4.5 inserted nucleic_ladder at index 8 and appended six dimensions to
 // CartoonSettings. Existing values keep their original semantic positions.
@@ -47,12 +120,39 @@ const LEGACY_CARTOON_TO_CURRENT: [usize; 16] =
 const LEGACY_OVERRIDES_TO_CURRENT: [usize; 9] = [1, 2, 3, 4, 5, 6, 7, 8, 9];
 const LEGACY_OVERRIDES_CARTOON_INDEX: usize = 0;
 
-// ObjectRegistrySnapshot positional layout is stable across v0.4.0-v0.4.5.
-// Molecule and map snapshots keep optional ObjectOverrides at these indices.
+// PyMOL-RS v0.3.3 had eight object-overridable groups. Patinae later added
+// the object group at index 0 and ellipsoid at index 9.
+const V033_OVERRIDES_TO_CURRENT: [usize; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+const V033_OVERRIDES_CARTOON_INDEX: usize = 0;
+const V033_OVERRIDES_STICK_INDEX: usize = 1;
+const V033_OVERRIDES_SPHERE_INDEX: usize = 2;
+const V033_OVERRIDES_SURFACE_INDEX: usize = 3;
+const V033_OVERRIDES_DOT_INDEX: usize = 6;
+const V033_OVERRIDES_MESH_INDEX: usize = 7;
+
+const CURRENT_OVERRIDES_CARTOON_INDEX: usize = 1;
+const CURRENT_OVERRIDES_STICK_INDEX: usize = 2;
+const CURRENT_OVERRIDES_SPHERE_INDEX: usize = 3;
+const CURRENT_OVERRIDES_SURFACE_INDEX: usize = 4;
+const CURRENT_OVERRIDES_DOT_INDEX: usize = 7;
+const CURRENT_OVERRIDES_MESH_INDEX: usize = 8;
+
+// Patinae v0.4 added stable renderer ids to the PyMOL-RS v0.3.3 registry.
+const V033_REGISTRY_TO_CURRENT: [usize; 7] = [0, 1, 2, 3, 4, 7, 8];
 const REGISTRY_MOLECULES_INDEX: usize = 0;
+const REGISTRY_GROUPS_INDEX: usize = 1;
 const REGISTRY_MAPS_INDEX: usize = 2;
+const REGISTRY_OBJECT_STATES_INDEX: usize = 4;
 const MOLECULE_OVERRIDES_INDEX: usize = 3;
 const MAP_OVERRIDES_INDEX: usize = 8;
+const SNAPSHOT_STATE_INDEX: usize = 1;
+const MOLECULE_DATA_INDEX: usize = 0;
+const MOLECULE_ATOMS_INDEX: usize = 0;
+const ATOM_REPRESENTATION_INDEX: usize = 20;
+
+const GROUP_STATE_INDEX: usize = 1;
+const SCENE_MANAGER_SCENES_INDEX: usize = 0;
+const SCENE_OBJECT_DATA_INDEX: usize = 7;
 
 #[derive(Debug)]
 enum SourceFormat {
@@ -177,11 +277,18 @@ fn upgrade_path(input: &Path, output: &Path) -> Result<UpgradeReport> {
             let (mut session_value, source) = extract_session(root)?;
             migrate_session(&mut session_value)?;
             let migrated_payload = encode_value(&session_value)?;
-            let session = rmp_serde::from_slice::<Session>(&migrated_payload).with_context(|| {
-                format!(
-                    "legacy migration produced a Session that the current decoder rejected; original decoder: {current_error}"
-                )
-            })?;
+            let session = match rmp_serde::from_slice::<Session>(&migrated_payload) {
+                Ok(session) => session,
+                Err(migrated_error) => {
+                    let field_diagnostic = validate_positional_session_fields(&session_value)
+                        .err()
+                        .map(|error| format!("; migrated field validation: {error:#}"))
+                        .unwrap_or_default();
+                    bail!(
+                        "legacy migration produced a Session that the current decoder rejected: {migrated_error}; original decoder: {current_error}{field_diagnostic}"
+                    )
+                }
+            };
             (session, source)
         }
     };
@@ -287,6 +394,12 @@ fn migrate_positional_session(session: &mut Value) -> Result<()> {
         "unsupported positional Session field count {}; expected 10 or 11",
         fields.len()
     );
+    let registry_field_count = fields
+        .get(SESSION_REGISTRY_INDEX)
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .context("legacy Session registry is not an array")?;
+    let is_v033 = registry_field_count == V033_REGISTRY_TO_CURRENT.len();
 
     migrate_positional_registry(
         fields
@@ -297,52 +410,230 @@ fn migrate_positional_session(session: &mut Value) -> Result<()> {
         fields
             .get_mut(SESSION_SETTINGS_INDEX)
             .context("legacy Session has no settings field")?,
-    )
+    )?;
+
+    if is_v033 {
+        migrate_v033_scenes(
+            fields
+                .get_mut(SESSION_SCENES_INDEX)
+                .context("PyMOL-RS v0.3.3 Session has no scenes field")?,
+        )?;
+        migrate_v033_session_colors(fields)?;
+    }
+    Ok(())
 }
 
 fn migrate_positional_settings(settings: &mut Value) -> Result<()> {
     let mut legacy = take_array(settings, "legacy Settings")?;
-    ensure!(
-        legacy.len() == LEGACY_SETTINGS_TO_CURRENT.len(),
-        "unsupported legacy Settings field count {}; expected {} for Patinae v0.4.0-v0.4.2",
-        legacy.len(),
-        LEGACY_SETTINGS_TO_CURRENT.len()
-    );
-    migrate_positional_cartoon(
-        legacy
-            .get_mut(LEGACY_SETTINGS_CARTOON_INDEX)
-            .context("legacy Settings has no cartoon group")?,
-        false,
-    )?;
-    *settings = merge_positional(
-        legacy,
-        positional_value(&Settings::default())?,
-        &LEGACY_SETTINGS_TO_CURRENT,
-        "Settings",
-    )?;
+    match legacy.len() {
+        count if count == LEGACY_SETTINGS_TO_CURRENT.len() => {
+            migrate_positional_cartoon(
+                legacy
+                    .get_mut(LEGACY_SETTINGS_CARTOON_INDEX)
+                    .context("legacy Settings has no cartoon group")?,
+                false,
+            )?;
+            *settings = merge_positional(
+                legacy,
+                positional_value(&Settings::default())?,
+                &LEGACY_SETTINGS_TO_CURRENT,
+                "Settings",
+            )?;
+        }
+        count if count == V033_SETTINGS_TO_CURRENT.len() => {
+            migrate_v033_positional_settings(&mut legacy)?;
+            *settings = merge_positional(
+                legacy,
+                positional_value(&Settings::default())?,
+                &V033_SETTINGS_TO_CURRENT,
+                "PyMOL-RS v0.3.3 Settings",
+            )?;
+        }
+        count => {
+            bail!(
+                "unsupported legacy Settings field count {count}; expected {} for PyMOL-RS v0.3.3 or {} for Patinae v0.4.0-v0.4.2",
+                V033_SETTINGS_TO_CURRENT.len(),
+                LEGACY_SETTINGS_TO_CURRENT.len()
+            )
+        }
+    }
     Ok(())
 }
 
 fn migrate_positional_object_overrides(overrides: &mut Value) -> Result<()> {
     let mut legacy = take_array(overrides, "legacy ObjectOverrides")?;
-    ensure!(
-        legacy.len() == LEGACY_OVERRIDES_TO_CURRENT.len(),
-        "unsupported legacy ObjectOverrides field count {}; expected {}",
-        legacy.len(),
-        LEGACY_OVERRIDES_TO_CURRENT.len()
-    );
-    migrate_positional_cartoon(
-        legacy
-            .get_mut(LEGACY_OVERRIDES_CARTOON_INDEX)
-            .context("legacy ObjectOverrides has no cartoon group")?,
-        true,
+    match legacy.len() {
+        count if count == LEGACY_OVERRIDES_TO_CURRENT.len() => {
+            migrate_positional_cartoon(
+                legacy
+                    .get_mut(LEGACY_OVERRIDES_CARTOON_INDEX)
+                    .context("legacy ObjectOverrides has no cartoon group")?,
+                true,
+            )?;
+            *overrides = merge_positional(
+                legacy,
+                positional_value(&ObjectOverrides::default())?,
+                &LEGACY_OVERRIDES_TO_CURRENT,
+                "ObjectOverrides",
+            )?;
+        }
+        count if count == V033_OVERRIDES_TO_CURRENT.len() => {
+            migrate_v033_positional_overrides(&mut legacy)?;
+            *overrides = merge_positional(
+                legacy,
+                positional_value(&ObjectOverrides::default())?,
+                &V033_OVERRIDES_TO_CURRENT,
+                "PyMOL-RS v0.3.3 ObjectOverrides",
+            )?;
+        }
+        count => {
+            bail!(
+                "unsupported legacy ObjectOverrides field count {count}; expected {} for PyMOL-RS v0.3.3 or {} for Patinae v0.4.0-v0.4.2",
+                V033_OVERRIDES_TO_CURRENT.len(),
+                LEGACY_OVERRIDES_TO_CURRENT.len()
+            )
+        }
+    }
+    Ok(())
+}
+
+fn migrate_v033_positional_settings(legacy: &mut [Value]) -> Result<()> {
+    let defaults = take_array(
+        &mut positional_value(&Settings::default())?,
+        "current Settings defaults",
     )?;
-    *overrides = merge_positional(
+    migrate_v033_group(
         legacy,
-        positional_value(&ObjectOverrides::default())?,
-        &LEGACY_OVERRIDES_TO_CURRENT,
-        "ObjectOverrides",
+        V033_SETTINGS_UI_INDEX,
+        &defaults,
+        CURRENT_SETTINGS_UI_INDEX,
+        &V033_UI_TO_CURRENT,
+        "UI settings",
     )?;
+    migrate_v033_group(
+        legacy,
+        V033_SETTINGS_CARTOON_INDEX,
+        &defaults,
+        CURRENT_SETTINGS_CARTOON_INDEX,
+        &V033_CARTOON_TO_CURRENT,
+        "cartoon settings",
+    )?;
+    migrate_v033_group(
+        legacy,
+        V033_SETTINGS_STICK_INDEX,
+        &defaults,
+        CURRENT_SETTINGS_STICK_INDEX,
+        &V033_STICK_TO_CURRENT,
+        "stick settings",
+    )?;
+    migrate_v033_group(
+        legacy,
+        V033_SETTINGS_SPHERE_INDEX,
+        &defaults,
+        CURRENT_SETTINGS_SPHERE_INDEX,
+        &V033_SPHERE_TO_CURRENT,
+        "sphere settings",
+    )?;
+    migrate_v033_group(
+        legacy,
+        V033_SETTINGS_SURFACE_INDEX,
+        &defaults,
+        CURRENT_SETTINGS_SURFACE_INDEX,
+        &V033_SURFACE_TO_CURRENT,
+        "surface settings",
+    )?;
+    migrate_v033_group(
+        legacy,
+        V033_SETTINGS_DOT_INDEX,
+        &defaults,
+        CURRENT_SETTINGS_DOT_INDEX,
+        &V033_DOT_TO_CURRENT,
+        "dot settings",
+    )?;
+    migrate_v033_group(
+        legacy,
+        V033_SETTINGS_MESH_INDEX,
+        &defaults,
+        CURRENT_SETTINGS_MESH_INDEX,
+        &V033_MESH_TO_CURRENT,
+        "mesh settings",
+    )?;
+    Ok(())
+}
+
+fn migrate_v033_positional_overrides(legacy: &mut [Value]) -> Result<()> {
+    let defaults = take_array(
+        &mut positional_value(&ObjectOverrides::default())?,
+        "current ObjectOverrides defaults",
+    )?;
+    migrate_v033_group(
+        legacy,
+        V033_OVERRIDES_CARTOON_INDEX,
+        &defaults,
+        CURRENT_OVERRIDES_CARTOON_INDEX,
+        &V033_CARTOON_TO_CURRENT,
+        "cartoon overrides",
+    )?;
+    migrate_v033_group(
+        legacy,
+        V033_OVERRIDES_STICK_INDEX,
+        &defaults,
+        CURRENT_OVERRIDES_STICK_INDEX,
+        &V033_STICK_TO_CURRENT,
+        "stick overrides",
+    )?;
+    migrate_v033_group(
+        legacy,
+        V033_OVERRIDES_SPHERE_INDEX,
+        &defaults,
+        CURRENT_OVERRIDES_SPHERE_INDEX,
+        &V033_SPHERE_TO_CURRENT,
+        "sphere overrides",
+    )?;
+    migrate_v033_group(
+        legacy,
+        V033_OVERRIDES_SURFACE_INDEX,
+        &defaults,
+        CURRENT_OVERRIDES_SURFACE_INDEX,
+        &V033_SURFACE_TO_CURRENT,
+        "surface overrides",
+    )?;
+    migrate_v033_group(
+        legacy,
+        V033_OVERRIDES_DOT_INDEX,
+        &defaults,
+        CURRENT_OVERRIDES_DOT_INDEX,
+        &V033_DOT_TO_CURRENT,
+        "dot overrides",
+    )?;
+    migrate_v033_group(
+        legacy,
+        V033_OVERRIDES_MESH_INDEX,
+        &defaults,
+        CURRENT_OVERRIDES_MESH_INDEX,
+        &V033_MESH_TO_CURRENT,
+        "mesh overrides",
+    )?;
+    Ok(())
+}
+
+fn migrate_v033_group(
+    legacy_groups: &mut [Value],
+    legacy_index: usize,
+    current_defaults: &[Value],
+    current_index: usize,
+    legacy_to_current: &[Option<usize>],
+    label: &str,
+) -> Result<()> {
+    let group = legacy_groups
+        .get_mut(legacy_index)
+        .with_context(|| format!("PyMOL-RS v0.3.3 Settings has no {label}"))?;
+    let legacy = take_array(group, &format!("PyMOL-RS v0.3.3 {label}"))?;
+    let defaults = current_defaults
+        .get(current_index)
+        .with_context(|| format!("current Settings defaults have no {label}"))?
+        .clone();
+    *group = merge_selected_positional(legacy, defaults, legacy_to_current, label)?;
     Ok(())
 }
 
@@ -369,18 +660,24 @@ fn migrate_positional_cartoon(cartoon: &mut Value, overrides: bool) -> Result<()
 }
 
 fn migrate_positional_registry(registry: &mut Value) -> Result<()> {
-    let fields = array_mut(registry, "ObjectRegistrySnapshot")?;
+    let field_count = registry
+        .as_array()
+        .map(Vec::len)
+        .context("ObjectRegistrySnapshot is not an array")?;
     ensure!(
-        fields.len() == 9,
-        "unsupported ObjectRegistrySnapshot field count {}; expected 9",
-        fields.len()
+        field_count == 9 || field_count == V033_REGISTRY_TO_CURRENT.len(),
+        "unsupported ObjectRegistrySnapshot field count {field_count}; expected {} for PyMOL-RS v0.3.3 or 9 for Patinae v0.4.0-v0.4.2",
+        V033_REGISTRY_TO_CURRENT.len()
     );
+    let is_v033 = field_count == V033_REGISTRY_TO_CURRENT.len();
+    let fields = array_mut(registry, "ObjectRegistrySnapshot")?;
     migrate_positional_snapshots(
         fields
             .get_mut(REGISTRY_MOLECULES_INDEX)
             .context("legacy registry has no molecules field")?,
         MOLECULE_OVERRIDES_INDEX,
         "molecule",
+        is_v033,
     )?;
     migrate_positional_snapshots(
         fields
@@ -388,13 +685,36 @@ fn migrate_positional_registry(registry: &mut Value) -> Result<()> {
             .context("legacy registry has no maps field")?,
         MAP_OVERRIDES_INDEX,
         "map",
-    )
+        is_v033,
+    )?;
+
+    if is_v033 {
+        migrate_v033_groups(
+            fields
+                .get_mut(REGISTRY_GROUPS_INDEX)
+                .context("PyMOL-RS v0.3.3 registry has no groups field")?,
+        )?;
+        migrate_v033_named_object_states(
+            fields
+                .get_mut(REGISTRY_OBJECT_STATES_INDEX)
+                .context("PyMOL-RS v0.3.3 registry has no object states field")?,
+        )?;
+        let legacy = take_array(registry, "PyMOL-RS v0.3.3 ObjectRegistrySnapshot")?;
+        *registry = merge_positional(
+            legacy,
+            current_registry_defaults()?,
+            &V033_REGISTRY_TO_CURRENT,
+            "ObjectRegistrySnapshot",
+        )?;
+    }
+    Ok(())
 }
 
 fn migrate_positional_snapshots(
     snapshots: &mut Value,
     overrides_index: usize,
     label: &str,
+    migrate_v033_state: bool,
 ) -> Result<()> {
     for (index, entry) in array_mut(snapshots, "registry snapshot collection")?
         .iter_mut()
@@ -408,6 +728,18 @@ fn migrate_positional_snapshots(
         );
         let snapshot = array_mut(&mut pair[1], "object snapshot")
             .with_context(|| format!("invalid {label} snapshot at index {index}"))?;
+        if migrate_v033_state {
+            if label == "molecule" {
+                migrate_v033_molecule(snapshot.get_mut(MOLECULE_DATA_INDEX).with_context(
+                    || format!("molecule snapshot at index {index} has no molecule field"),
+                )?)
+                .with_context(|| format!("failed to migrate molecule data at index {index}"))?;
+            }
+            migrate_v033_object_state(snapshot.get_mut(SNAPSHOT_STATE_INDEX).with_context(
+                || format!("{label} snapshot at index {index} has no state field"),
+            )?)
+            .with_context(|| format!("failed to migrate {label} state at index {index}"))?;
+        }
         let overrides = snapshot
             .get_mut(overrides_index)
             .with_context(|| format!("{label} snapshot at index {index} has no overrides field"))?;
@@ -416,6 +748,261 @@ fn migrate_positional_snapshots(
                 .with_context(|| format!("failed to migrate {label} overrides at index {index}"))?;
         }
     }
+    Ok(())
+}
+
+fn migrate_v033_molecule(molecule: &mut Value) -> Result<()> {
+    let molecule_fields = array_mut(molecule, "PyMOL-RS v0.3.3 ObjectMolecule")?;
+    let atoms = molecule_fields
+        .get_mut(MOLECULE_ATOMS_INDEX)
+        .context("PyMOL-RS v0.3.3 ObjectMolecule has no atoms field")?;
+    for (index, atom) in array_mut(atoms, "PyMOL-RS v0.3.3 atom collection")?
+        .iter_mut()
+        .enumerate()
+    {
+        let atom_fields = array_mut(atom, "PyMOL-RS v0.3.3 Atom")
+            .with_context(|| format!("invalid atom at index {index}"))?;
+        let representation = atom_fields
+            .get_mut(ATOM_REPRESENTATION_INDEX)
+            .with_context(|| format!("atom at index {index} has no representation field"))?;
+        migrate_v033_atom_representation(representation)
+            .with_context(|| format!("failed to migrate atom representation at index {index}"))?;
+    }
+    Ok(())
+}
+
+fn migrate_v033_atom_representation(representation: &mut Value) -> Result<()> {
+    let legacy = take_array(representation, "PyMOL-RS v0.3.3 AtomRepresentation")?;
+    ensure!(
+        legacy.len() == 9,
+        "PyMOL-RS v0.3.3 AtomRepresentation has {} fields; expected 9",
+        legacy.len()
+    );
+    let [
+        colors,
+        sphere_scale,
+        visible_reps,
+        cartoon,
+        text_type,
+        label,
+        masked,
+        unique_id,
+        has_setting,
+    ]: [Value; 9] = legacy.try_into().map_err(|values: Vec<Value>| {
+        anyhow::anyhow!(
+            "PyMOL-RS v0.3.3 AtomRepresentation has {} fields; expected 9",
+            values.len()
+        )
+    })?;
+    let mut colors = match colors {
+        Value::Array(fields) => fields,
+        other => bail!(
+            "PyMOL-RS v0.3.3 AtomColors is {}, expected an array",
+            value_kind(&other)
+        ),
+    };
+    ensure!(
+        colors.len() == 8,
+        "PyMOL-RS v0.3.3 AtomColors has {} fields; expected 8",
+        colors.len()
+    );
+    colors.push(Value::from(i32::MIN));
+    colors.push(Value::from(i32::MIN));
+    *representation = Value::Array(vec![
+        Value::Array(colors),
+        sphere_scale,
+        Value::Nil,
+        Value::Nil,
+        Value::Nil,
+        Value::Nil,
+        Value::Nil,
+        visible_reps,
+        cartoon,
+        text_type,
+        label,
+        masked,
+        unique_id,
+        has_setting,
+    ]);
+    Ok(())
+}
+
+fn current_registry_defaults() -> Result<Value> {
+    let mut session = take_array(
+        &mut positional_value(&Session::new())?,
+        "current Session defaults",
+    )?;
+    session
+        .get_mut(SESSION_REGISTRY_INDEX)
+        .map(|registry| std::mem::replace(registry, Value::Nil))
+        .context("current Session defaults have no registry field")
+}
+
+fn migrate_v033_groups(groups: &mut Value) -> Result<()> {
+    for (index, entry) in array_mut(groups, "registry group collection")?
+        .iter_mut()
+        .enumerate()
+    {
+        let pair = array_mut(entry, "named group tuple")
+            .with_context(|| format!("invalid group entry at index {index}"))?;
+        ensure!(
+            pair.len() == 2,
+            "invalid group entry at index {index}: expected a name/data pair"
+        );
+        let group = array_mut(&mut pair[1], "GroupObject")
+            .with_context(|| format!("invalid group snapshot at index {index}"))?;
+        migrate_v033_object_state(
+            group
+                .get_mut(GROUP_STATE_INDEX)
+                .with_context(|| format!("group snapshot at index {index} has no state field"))?,
+        )
+        .with_context(|| format!("failed to migrate group state at index {index}"))?;
+    }
+    Ok(())
+}
+
+fn migrate_v033_named_object_states(states: &mut Value) -> Result<()> {
+    for (index, entry) in array_mut(states, "registry object state collection")?
+        .iter_mut()
+        .enumerate()
+    {
+        let pair = array_mut(entry, "named object state tuple")
+            .with_context(|| format!("invalid object state entry at index {index}"))?;
+        ensure!(
+            pair.len() == 2,
+            "invalid object state entry at index {index}: expected a name/state pair"
+        );
+        migrate_v033_object_state(&mut pair[1])
+            .with_context(|| format!("failed to migrate object state at index {index}"))?;
+    }
+    Ok(())
+}
+
+fn migrate_v033_object_state(state: &mut Value) -> Result<()> {
+    let legacy = take_array(state, "PyMOL-RS v0.3.3 ObjectState")?;
+    ensure!(
+        legacy.len() == 4,
+        "unsupported PyMOL-RS v0.3.3 ObjectState field count {}; expected 4",
+        legacy.len()
+    );
+    let visible_reps = legacy
+        .get(2)
+        .context("PyMOL-RS v0.3.3 ObjectState has no visible_reps field")?
+        .clone();
+    let mut current = match merge_positional(
+        legacy,
+        positional_value(&ObjectState::default())?,
+        &[0, 1, 2, 4],
+        "ObjectState",
+    )? {
+        Value::Array(fields) => fields,
+        _ => unreachable!("merge_positional always returns an array"),
+    };
+    current[3] = visible_reps;
+    *state = Value::Array(current);
+    Ok(())
+}
+
+fn migrate_v033_scenes(scenes: &mut Value) -> Result<()> {
+    let manager = array_mut(scenes, "PyMOL-RS v0.3.3 SceneManager")?;
+    let scene_map = manager
+        .get_mut(SCENE_MANAGER_SCENES_INDEX)
+        .context("PyMOL-RS v0.3.3 SceneManager has no scenes map")?;
+    let Value::Map(entries) = scene_map else {
+        bail!(
+            "PyMOL-RS v0.3.3 SceneManager scenes are {}, expected a map",
+            value_kind(scene_map)
+        )
+    };
+    for (scene_name, scene) in entries {
+        let scene_label = scene_name.as_str().unwrap_or("<unnamed>");
+        let scene_fields = array_mut(scene, "PyMOL-RS v0.3.3 Scene")
+            .with_context(|| format!("invalid scene {scene_label}"))?;
+        let object_data = scene_fields
+            .get_mut(SCENE_OBJECT_DATA_INDEX)
+            .with_context(|| format!("scene {scene_label} has no object_data field"))?;
+        let Value::Map(objects) = object_data else {
+            bail!(
+                "scene {scene_label} object_data is {}, expected a map",
+                value_kind(object_data)
+            )
+        };
+        for (object_name, data) in objects {
+            let object_label = object_name.as_str().unwrap_or("<unnamed>");
+            let legacy = take_array(data, "PyMOL-RS v0.3.3 SceneObjectData")
+                .with_context(|| format!("invalid scene object {object_label}"))?;
+            ensure!(
+                legacy.len() == 5,
+                "scene object {object_label} has {} fields; expected 5",
+                legacy.len()
+            );
+            let draw_reps = legacy
+                .get(2)
+                .context("PyMOL-RS v0.3.3 SceneObjectData has no visible_reps field")?
+                .clone();
+            let [enabled, color, visible_reps, current_state, per_atom_data]: [Value; 5] =
+                legacy.try_into().map_err(|values: Vec<Value>| {
+                    anyhow::anyhow!(
+                        "scene object {object_label} has {} fields; expected 5",
+                        values.len()
+                    )
+                })?;
+            *data = Value::Array(vec![
+                enabled,
+                color,
+                visible_reps,
+                draw_reps,
+                Value::Nil,
+                current_state,
+                per_atom_data,
+            ]);
+        }
+    }
+    Ok(())
+}
+
+fn migrate_v033_session_colors(fields: &mut [Value]) -> Result<()> {
+    ensure!(
+        fields.len() == 11,
+        "PyMOL-RS v0.3.3 Session has {} fields; expected 11",
+        fields.len()
+    );
+    let element_colors = std::mem::replace(
+        fields
+            .get_mut(V033_SESSION_ELEMENT_COLORS_INDEX)
+            .context("PyMOL-RS v0.3.3 Session has no element colors field")?,
+        Value::Nil,
+    );
+    let clear_color = std::mem::replace(
+        fields
+            .get_mut(V033_SESSION_CLEAR_COLOR_INDEX)
+            .context("PyMOL-RS v0.3.3 Session has no clear color field")?,
+        Value::Nil,
+    );
+
+    let mut defaults = take_array(
+        &mut positional_value(&Session::new())?,
+        "current Session defaults",
+    )?;
+    let mut palette = std::mem::replace(
+        defaults
+            .get_mut(SESSION_PALETTE_INDEX)
+            .context("current Session defaults have no themed palette field")?,
+        Value::Nil,
+    );
+    let palette_fields = array_mut(&mut palette, "current ThemedPalette defaults")?;
+    let element_palette = palette_fields
+        .get_mut(0)
+        .context("current ThemedPalette defaults have no element palette")?;
+    *element_palette = element_colors;
+
+    fields[SESSION_PALETTE_INDEX] = palette;
+    fields[SESSION_CLEAR_COLOR_INDEX] = clear_color;
+    fields[SESSION_CLEAR_COLOR_SET_INDEX] = Value::Boolean(true);
+    ensure!(
+        !fields[SESSION_NAMED_PALETTE_INDEX].is_nil(),
+        "PyMOL-RS v0.3.3 Session has no named colors"
+    );
     Ok(())
 }
 
@@ -519,6 +1106,36 @@ fn merge_positional(
     Ok(Value::Array(current))
 }
 
+fn merge_selected_positional(
+    legacy: Vec<Value>,
+    current_defaults: Value,
+    legacy_to_current: &[Option<usize>],
+    label: &str,
+) -> Result<Value> {
+    ensure!(
+        legacy.len() == legacy_to_current.len(),
+        "{label} migration mapping has {} entries for {} legacy fields",
+        legacy_to_current.len(),
+        legacy.len()
+    );
+    let mut current = match current_defaults {
+        Value::Array(fields) => fields,
+        other => bail!(
+            "current {label} defaults encoded as {}, expected an array",
+            value_kind(&other)
+        ),
+    };
+    for (legacy_value, current_index) in legacy.into_iter().zip(legacy_to_current) {
+        if let Some(current_index) = current_index {
+            let field = current.get_mut(*current_index).with_context(|| {
+                format!("{label} migration targets missing current field {current_index}")
+            })?;
+            *field = legacy_value;
+        }
+    }
+    Ok(Value::Array(current))
+}
+
 fn merge_named(target: &mut Value, current_defaults: Value, label: &str) -> Result<()> {
     let legacy = take_map(target, &format!("legacy {label}"))?;
     let mut current = match current_defaults {
@@ -568,6 +1185,66 @@ fn encode_value(value: &Value) -> Result<Vec<u8>> {
     rmpv::encode::write_value(&mut bytes, value)
         .context("failed to encode migrated MessagePack")?;
     Ok(bytes)
+}
+
+fn validate_positional_session_fields(session: &Value) -> Result<()> {
+    let fields = session
+        .as_array()
+        .context("migrated Session is not positional")?;
+    ensure!(
+        fields.len() == 11,
+        "migrated positional Session has {} fields; expected 11",
+        fields.len()
+    );
+    validate_field::<patinae_scene::ObjectRegistrySnapshot>(fields, 0, "registry")?;
+    validate_field::<patinae_scene::prelude::Camera>(fields, 1, "camera")?;
+    validate_field::<patinae_scene::SelectionManager>(fields, 2, "selections")?;
+    validate_field::<patinae_scene::SceneManager>(fields, 3, "scenes")?;
+    validate_field::<patinae_scene::ViewManager>(fields, 4, "views")?;
+    validate_field::<patinae_scene::Movie>(fields, 5, "movie")?;
+    validate_positional_settings_fields(
+        fields
+            .get(6)
+            .context("migrated Session has no settings field")?,
+    )?;
+    validate_field::<Settings>(fields, 6, "settings")?;
+    validate_field::<patinae_scene::NamedPalette>(fields, 7, "named_palette")?;
+    validate_field::<patinae_scene::ThemedPalette>(fields, 8, "palette")?;
+    validate_field::<[f32; 3]>(fields, 9, "clear_color")?;
+    validate_field::<bool>(fields, 10, "clear_color_set")
+}
+
+fn validate_positional_settings_fields(settings: &Value) -> Result<()> {
+    let fields = settings
+        .as_array()
+        .context("migrated Settings is not positional")?;
+    validate_field::<patinae_settings::groups::ShadingSettings>(fields, 0, "settings.shading")?;
+    validate_field::<patinae_settings::groups::UiSettings>(fields, 1, "settings.ui")?;
+    validate_field::<patinae_settings::groups::MovieSettings>(fields, 2, "settings.movie")?;
+    validate_field::<patinae_settings::groups::RendererSettings>(fields, 3, "settings.renderer")?;
+    validate_field::<patinae_settings::groups::BehaviorSettings>(fields, 4, "settings.behavior")?;
+    validate_field::<patinae_settings::groups::SsaoSettings>(fields, 5, "settings.ssao")?;
+    validate_field::<patinae_settings::groups::FxaaSettings>(fields, 6, "settings.fxaa")?;
+    validate_field::<patinae_settings::groups::ObjectSettings>(fields, 7, "settings.object")?;
+    validate_field::<CartoonSettings>(fields, 8, "settings.cartoon")?;
+    validate_field::<patinae_settings::groups::StickSettings>(fields, 9, "settings.stick")?;
+    validate_field::<patinae_settings::groups::SphereSettings>(fields, 10, "settings.sphere")?;
+    validate_field::<patinae_settings::groups::SurfaceSettings>(fields, 11, "settings.surface")?;
+    validate_field::<patinae_settings::groups::RibbonSettings>(fields, 12, "settings.ribbon")?;
+    validate_field::<patinae_settings::groups::LineSettings>(fields, 13, "settings.line")?;
+    validate_field::<patinae_settings::groups::DotSettings>(fields, 14, "settings.dot")?;
+    validate_field::<patinae_settings::groups::MeshSettings>(fields, 15, "settings.mesh")?;
+    validate_field::<patinae_settings::groups::EllipsoidSettings>(fields, 16, "settings.ellipsoid")
+}
+
+fn validate_field<T: DeserializeOwned>(fields: &[Value], index: usize, label: &str) -> Result<()> {
+    let value = fields
+        .get(index)
+        .with_context(|| format!("migrated Session has no {label} field"))?;
+    let bytes = encode_value(value)?;
+    rmp_serde::from_slice::<T>(&bytes)
+        .map(|_| ())
+        .with_context(|| format!("migrated Session field {label} is invalid"))
 }
 
 fn array_mut<'a>(value: &'a mut Value, label: &str) -> Result<&'a mut Vec<Value>> {
@@ -683,6 +1360,69 @@ mod tests {
     }
 
     #[test]
+    fn positional_v033_session_upgrades_settings_and_palettes() {
+        let paths = TestPaths::new("positional_v033");
+        let mut session = Session::new();
+        session.settings.cartoon.power = 5.75;
+        session.clear_color = [0.2, 0.3, 0.4];
+        let expected_carbon = session.palette.element.get(6);
+        let mut value = positional_value(&session).unwrap();
+        downgrade_v033_positional_session(&mut value).unwrap();
+        write_gzip_value(&paths.input, &value).unwrap();
+
+        let report = upgrade_path(&paths.input, &paths.output).unwrap();
+        let upgraded = load_prs_document(&paths.output).unwrap();
+
+        assert!(matches!(report.source, SourceFormat::LegacyRawSession));
+        assert_eq!(upgraded.session.settings.cartoon.power, 5.75);
+        assert_eq!(upgraded.session.clear_color, [0.2, 0.3, 0.4]);
+        assert!(upgraded.session.clear_color_set);
+        assert_eq!(upgraded.session.palette.element.get(6), expected_carbon);
+    }
+
+    #[test]
+    fn positional_v033_object_state_restores_draw_mask() {
+        let mut current = take_array(
+            &mut positional_value(&ObjectState::default()).unwrap(),
+            "current ObjectState",
+        )
+        .unwrap();
+        let mut legacy =
+            select_legacy_fields(&mut current, &[0, 1, 2, 4], "current ObjectState").unwrap();
+
+        migrate_v033_object_state(&mut legacy).unwrap();
+        let upgraded: ObjectState = rmp_serde::from_slice(&encode_value(&legacy).unwrap()).unwrap();
+
+        assert_eq!(upgraded.draw_reps, upgraded.visible_reps);
+    }
+
+    #[test]
+    fn positional_v033_atom_representation_inserts_transparency_fields() {
+        let colors = Value::Array((0_i32..8).map(Value::from).collect());
+        let mut representation = Value::Array(vec![
+            colors,
+            Value::Nil,
+            Value::from(128_u32),
+            Value::from(2_i64),
+            Value::from(""),
+            Value::from("label"),
+            Value::Boolean(false),
+            Value::Nil,
+            Value::Boolean(false),
+        ]);
+
+        migrate_v033_atom_representation(&mut representation).unwrap();
+        let fields = representation.as_array().unwrap();
+
+        assert_eq!(fields.len(), 14);
+        assert!(fields[2..7].iter().all(Value::is_nil));
+        assert_eq!(fields[7].as_u64(), Some(128));
+        assert_eq!(fields[9].as_str(), Some(""));
+        assert_eq!(fields[10].as_str(), Some("label"));
+        assert_eq!(fields[0].as_array().unwrap().len(), 10);
+    }
+
+    #[test]
     fn named_v042_document_upgrades_and_fills_new_fields() {
         let paths = TestPaths::new("named");
         let mut session = Session::new();
@@ -765,6 +1505,153 @@ mod tests {
         )
     }
 
+    fn downgrade_v033_positional_session(session: &mut Value) -> Result<()> {
+        let fields = array_mut(session, "current Session")?;
+        downgrade_v033_positional_registry(
+            fields
+                .get_mut(SESSION_REGISTRY_INDEX)
+                .context("current Session has no registry field")?,
+        )?;
+        downgrade_v033_positional_settings(
+            fields
+                .get_mut(SESSION_SETTINGS_INDEX)
+                .context("current Session has no settings field")?,
+        )?;
+
+        let clear_color = std::mem::replace(
+            fields
+                .get_mut(SESSION_CLEAR_COLOR_INDEX)
+                .context("current Session has no clear color field")?,
+            Value::Nil,
+        );
+        let mut palette = take_array(
+            fields
+                .get_mut(SESSION_PALETTE_INDEX)
+                .context("current Session has no themed palette field")?,
+            "current ThemedPalette",
+        )?;
+        let element_colors = std::mem::replace(
+            palette
+                .get_mut(0)
+                .context("current ThemedPalette has no element palette")?,
+            Value::Nil,
+        );
+        fields[V033_SESSION_ELEMENT_COLORS_INDEX] = element_colors;
+        fields[SESSION_CLEAR_COLOR_INDEX] = Value::Nil;
+        fields[V033_SESSION_CLEAR_COLOR_INDEX] = clear_color;
+        Ok(())
+    }
+
+    fn downgrade_v033_positional_registry(registry: &mut Value) -> Result<()> {
+        let mut current = take_array(registry, "current ObjectRegistrySnapshot")?;
+        *registry = select_legacy_fields(
+            &mut current,
+            &V033_REGISTRY_TO_CURRENT,
+            "current ObjectRegistrySnapshot",
+        )?;
+        Ok(())
+    }
+
+    fn downgrade_v033_positional_settings(settings: &mut Value) -> Result<()> {
+        const CARTOON_FIELDS: [usize; 15] = [0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15];
+
+        let mut current = take_array(settings, "current Settings")?;
+
+        let mut ui = select_legacy_values(
+            array_mut(
+                current
+                    .get_mut(CURRENT_SETTINGS_UI_INDEX)
+                    .context("current Settings has no UI group")?,
+                "current UI settings",
+            )?,
+            &[1, 2, 3, 4, 5, 6, 7],
+            "current UI settings",
+        )?;
+        ui.extend([
+            Value::from(0_i64),
+            Value::from(0x00004D_i64),
+            Value::from(0x333380_i64),
+        ]);
+        current[CURRENT_SETTINGS_UI_INDEX] = Value::Array(ui);
+
+        let cartoon = select_legacy_values(
+            array_mut(
+                current
+                    .get_mut(CURRENT_SETTINGS_CARTOON_INDEX)
+                    .context("current Settings has no cartoon group")?,
+                "current cartoon settings",
+            )?,
+            &CARTOON_FIELDS,
+            "current cartoon settings",
+        )?;
+        current[CURRENT_SETTINGS_CARTOON_INDEX] = Value::Array(cartoon);
+
+        let mut stick = select_legacy_values(
+            array_mut(
+                current
+                    .get_mut(CURRENT_SETTINGS_STICK_INDEX)
+                    .context("current Settings has no stick group")?,
+                "current stick settings",
+            )?,
+            &[0, 1, 2, 3],
+            "current stick settings",
+        )?;
+        stick.push(Value::F32(0.06));
+        current[CURRENT_SETTINGS_STICK_INDEX] = Value::Array(stick);
+
+        let sphere = array_mut(
+            current
+                .get_mut(CURRENT_SETTINGS_SPHERE_INDEX)
+                .context("current Settings has no sphere group")?,
+            "current sphere settings",
+        )?;
+        let mut sphere_legacy = select_legacy_values(sphere, &[0, 1], "current sphere settings")?;
+        sphere_legacy.insert(1, Value::from(1_i64));
+        current[CURRENT_SETTINGS_SPHERE_INDEX] = Value::Array(sphere_legacy);
+
+        let surface = select_legacy_values(
+            array_mut(
+                current
+                    .get_mut(CURRENT_SETTINGS_SURFACE_INDEX)
+                    .context("current Settings has no surface group")?,
+                "current surface settings",
+            )?,
+            &[0, 9, 2, 3, 6, 7, 8],
+            "current surface settings",
+        )?;
+        current[CURRENT_SETTINGS_SURFACE_INDEX] = Value::Array(surface);
+
+        let mut dot = select_legacy_values(
+            array_mut(
+                current
+                    .get_mut(CURRENT_SETTINGS_DOT_INDEX)
+                    .context("current Settings has no dot group")?,
+                "current dot settings",
+            )?,
+            &[1, 2],
+            "current dot settings",
+        )?;
+        dot.push(Value::Boolean(true));
+        current[CURRENT_SETTINGS_DOT_INDEX] = Value::Array(dot);
+
+        let mut mesh = select_legacy_values(
+            array_mut(
+                current
+                    .get_mut(CURRENT_SETTINGS_MESH_INDEX)
+                    .context("current Settings has no mesh group")?,
+                "current mesh settings",
+            )?,
+            &[0],
+            "current mesh settings",
+        )?;
+        mesh.push(Value::Boolean(true));
+        current[CURRENT_SETTINGS_MESH_INDEX] = Value::Array(mesh);
+
+        *settings =
+            select_legacy_fields(&mut current, &V033_SETTINGS_TO_CURRENT, "current Settings")?;
+        Ok(())
+    }
+
     fn downgrade_positional_settings(settings: &mut Value) -> Result<()> {
         let mut current = take_array(settings, "current Settings")?;
         downgrade_positional_cartoon(
@@ -810,6 +1697,18 @@ mod tests {
         legacy_to_current: &[usize],
         label: &str,
     ) -> Result<Value> {
+        Ok(Value::Array(select_legacy_values(
+            current,
+            legacy_to_current,
+            label,
+        )?))
+    }
+
+    fn select_legacy_values(
+        current: &mut [Value],
+        legacy_to_current: &[usize],
+        label: &str,
+    ) -> Result<Vec<Value>> {
         let mut legacy = Vec::with_capacity(legacy_to_current.len());
         for current_index in legacy_to_current {
             let field = current.get_mut(*current_index).with_context(|| {
@@ -817,7 +1716,7 @@ mod tests {
             })?;
             legacy.push(std::mem::replace(field, Value::Nil));
         }
-        Ok(Value::Array(legacy))
+        Ok(legacy)
     }
 
     fn downgrade_named_session(session: &mut Value) -> Result<()> {

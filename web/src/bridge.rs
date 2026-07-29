@@ -1077,9 +1077,10 @@ impl WebViewer {
         let fmt = format.to_lowercase();
 
         if fmt == "prs" {
-            let session: Session = rmp_serde::from_slice(data)
+            let document = patinae_session::decode_prs_document(data)
                 .map_err(|e| JsValue::from_str(&format!("PRS parse error: {}", e)))?;
-            self.session = session;
+            self.pending_warnings.extend(document.warning_messages());
+            self.session = document.session;
             self.session.registry.mark_all_dirty();
             self.needs_redraw = true;
             return Ok(());
