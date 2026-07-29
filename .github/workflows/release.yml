@@ -652,6 +652,14 @@ jobs:
             echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
           fi
 
+      - name: Detect release notes
+        id: release_notes
+        shell: bash
+        run: |
+          if [[ -f RELEASE_NOTES.md ]]; then
+            echo "body_path=RELEASE_NOTES.md" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
@@ -659,5 +667,5 @@ jobs:
           name: Release ${{ steps.tag.outputs.tag }}
           draft: false
           prerelease: ${{ contains(steps.tag.outputs.tag, '-') }}
-          generate_release_notes: true
+          body_path: ${{ steps.release_notes.outputs.body_path }}
           files: release/*
