@@ -18,6 +18,7 @@ use crate::api::types::{
 };
 use crate::api::{self, ApiError};
 use crate::auth;
+use crate::settings::DEFAULT_EFFORT;
 use crate::tools;
 
 /// Ceiling on tool-call round trips within a single user turn, so a
@@ -44,7 +45,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             model: DEFAULT_MODEL.to_string(),
-            effort: "xhigh".to_string(),
+            effort: DEFAULT_EFFORT.to_string(),
             max_tokens: 64_000,
             allow_python: true,
             system_prompt: String::new(),
@@ -425,10 +426,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_config_targets_opus_5_at_xhigh() {
+    fn default_config_targets_sonnet_5_at_medium() {
         let c = Config::default();
-        assert_eq!(c.model, "claude-opus-5");
-        assert_eq!(c.effort, "xhigh");
+        assert_eq!(c.model, "claude-sonnet-5");
+        assert_eq!(c.effort, "medium");
         assert_eq!(c.max_tokens, 64_000);
     }
 

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 /// Default model. Thinking is on by default on this model, so no `thinking`
 /// field is sent at all.
-pub const DEFAULT_MODEL: &str = "claude-opus-5";
+pub const DEFAULT_MODEL: &str = "claude-sonnet-5";
 
 // =============================================================================
 // Content blocks
