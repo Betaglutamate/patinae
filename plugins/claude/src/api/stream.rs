@@ -119,9 +119,18 @@ pub enum TurnEvent {
 #[derive(Debug, Clone)]
 enum Partial {
     Text(String),
-    Thinking { thinking: String, signature: String },
-    RedactedThinking { data: String },
-    ToolUse { id: String, name: String, json: String },
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
+    RedactedThinking {
+        data: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        json: String,
+    },
 }
 
 /// Assembles SSE events into a complete [`AssistantTurn`].
@@ -523,7 +532,10 @@ mod tests {
         // Content is empty on a pre-output refusal — indexing content[0] here
         // is exactly the bug this guards against.
         assert!(turn.content.is_empty());
-        assert_eq!(turn.stop_details.unwrap().category.as_deref(), Some("cyber"));
+        assert_eq!(
+            turn.stop_details.unwrap().category.as_deref(),
+            Some("cyber")
+        );
     }
 
     #[test]

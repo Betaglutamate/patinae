@@ -42,7 +42,9 @@ impl AuthState {
                  https://github.com/anthropics/anthropic-cli/releases \
                  (or `brew install anthropics/tap/ant`), then sign in."
             }
-            AuthState::SignedOut => "Not signed in. Click Sign in to authorize with your Claude account.",
+            AuthState::SignedOut => {
+                "Not signed in. Click Sign in to authorize with your Claude account."
+            }
             AuthState::SignedIn => "Signed in.",
         }
     }
