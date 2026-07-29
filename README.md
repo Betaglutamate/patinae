@@ -147,7 +147,8 @@ polymer and not solvent
 - Electron density map loading and contouring.
 
 **Sessions:** save and load Patinae `.prs` sessions and import legacy `.pse`
-sessions for interoperability.
+sessions for interoperability. Upgrade Patinae v0.4.0–v0.4.2 sessions with
+`cargo run -p prs-upgrade -- old.prs upgraded.prs`.
 
 **Ray tracing:** the `raytracer` plugin provides offline GPU ray tracing with
 BVH acceleration, shadows, transparency, and edge detection.
@@ -284,6 +285,7 @@ patinae/
 ├── crates/patinae-plugin      Plugin SDK
 ├── crates/patinae-plugin-host Runtime plugin host for front ends
 ├── plugins                    Reference Rust plugins
+├── tools/prs-upgrade          Legacy `.prs` migration utility
 ├── python                     Python package and Jupyter widget
 └── web                        WebAssembly/WebGPU viewer package
 ```

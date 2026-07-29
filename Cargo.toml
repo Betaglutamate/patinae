@@ -19,6 +19,7 @@ members = [
     "plugins/ipc",
     "plugins/python",
     "plugins/raytracer",
+    "tools/prs-upgrade",
     "bench",
     "patinae",
 ]
@@ -37,6 +38,7 @@ default-members = [
     "crates/patinae-algos",
     "crates/patinae-session",
     "crates/patinae-mm",
+    "tools/prs-upgrade",
     "patinae",
 ]
 # python API requires maturin to build (use: cd python && maturin build)
@@ -81,6 +83,7 @@ patinae-plugin-host = { version = "0.4.5", path = "crates/patinae-plugin-host" }
 patinae-mm = { version = "0.4.5", path = "crates/patinae-mm" }
 
 # External dependencies
+anyhow = "1"
 bitflags = { version = "2", features = ["serde"] }
 lin_alg = { version = "1.1", features = ["computer_graphics"] }
 wgpu = "29"
@@ -104,6 +107,7 @@ dirs = "5"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 rmp-serde = "1"
+rmpv = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 webbrowser = "1.2"
