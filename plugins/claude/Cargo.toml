@@ -1,0 +1,42 @@
+[package]
+name = "claude-plugin"
+edition = "2021"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description = "Patinae Claude plugin: an in-viewer AI agent that drives the scene"
+
+[lib]
+# rlib alongside cdylib so the agent loop, SSE parser, and tool schemas stay
+# unit-testable without loading the plugin into a host.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+patinae-plugin = { path = "../../crates/patinae-plugin" }
+patinae-framework = { path = "../../crates/patinae-framework" }
+patinae-scene = { path = "../../crates/patinae-scene", default-features = false }
+patinae-settings = { path = "../../crates/patinae-settings" }
+
+# HTTP: mirrors crates/patinae-io/src/fetch.rs. `rustls-no-provider` means the
+# ring crypto provider must be installed once at startup before any request
+# (see api::ensure_rustls_crypto_provider).
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls-no-provider",
+    "gzip",
+    "json",
+    "stream",
+] }
+rustls = { workspace = true }
+tokio = { workspace = true }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = "0.22"
+log = { workspace = true }
+
+[lints]
+workspace = true
