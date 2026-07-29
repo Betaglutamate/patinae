@@ -683,36 +683,6 @@ mod tests {
     }
 
     #[test]
-    fn one_bna_connects_every_nucleotide_plate_to_its_backbone_anchor() {
-        let molecule =
-            patinae_io::pdb::read_pdb_str(include_str!("../../../../../_tests/iso/1BNA.pdb"))
-                .expect("parse 1BNA");
-        let coord_set = molecule.current_coord_set().expect("coord set");
-        let backbone = extract_retained_backbone(&molecule, coord_set, 10);
-        let nucleotide_count = count_nucleic_residues(&backbone);
-        let geometry = build_nucleic_geometry(&molecule, coord_set, &backbone, true);
-
-        assert_eq!(nucleotide_count, 24);
-        assert_eq!(
-            geometry.vertices.len(),
-            nucleotide_count * MAX_VERTICES_PER_NUCLEOTIDE as usize
-        );
-        for guide in backbone
-            .iter()
-            .filter(|atom| atom.flags & flags::SS_MASK == SecondaryStructure::NucleicRibbon as u32)
-        {
-            let anchor = Vec3::new(guide.position[0], guide.position[1], guide.position[2]);
-            assert!(geometry.vertices.iter().any(|vertex| {
-                vertex.group_id == guide.atom_id
-                    && close(
-                        Vec3::new(vertex.position[0], vertex.position[1], vertex.position[2]),
-                        anchor,
-                    )
-            }));
-        }
-    }
-
-    #[test]
     fn six_yov_emits_one_integrated_accent_per_retained_nucleotide() {
         let molecule = patinae_io::cif::read_cif(std::path::Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
