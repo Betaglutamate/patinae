@@ -10,7 +10,7 @@
 //! This links the plugin as an rlib and validates the declaration the cdylib
 //! exports, so it exercises the real symbol without needing `dlopen` or a GUI.
 
-use claude_plugin::PATINAE_PLUGIN_DECLARATION as DECL;
+use ai_plugin::PATINAE_PLUGIN_DECLARATION as DECL;
 use patinae_plugin::ffi;
 use patinae_plugin_host::validate_declaration_versions;
 

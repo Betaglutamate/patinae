@@ -15,7 +15,7 @@ members = [
     "crates/patinae-algos",
     "crates/patinae-session",
     "crates/patinae-mm",
-    "plugins/claude",
+    "plugins/ai",
     "plugins/hello",
     "plugins/ipc",
     "plugins/python",

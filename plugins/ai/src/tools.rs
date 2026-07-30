@@ -20,7 +20,7 @@ use patinae_framework::model::sequence::{
 use patinae_plugin::prelude::{parse_commands, select, ViewerLike};
 use serde_json::{json, Value};
 
-use crate::api::types::Tool;
+use crate::provider::ToolSpec;
 
 pub const RUN_COMMAND: &str = "run_command";
 pub const RUN_PYTHON: &str = "run_python";
@@ -73,9 +73,9 @@ fn is_code_executing(name: &str) -> bool {
 /// `allow_python` drops `run_python` entirely when the setting is off or the
 /// `python-plugin` is not installed — a tool that always errors is worse than
 /// one Claude never sees.
-pub fn schemas(allow_python: bool) -> Vec<Tool> {
+pub fn schemas(allow_python: bool) -> Vec<ToolSpec> {
     let mut tools = vec![
-        Tool {
+        ToolSpec {
             name: RUN_COMMAND.to_string(),
             description: "Run one or more Patinae viewer commands. This is your primary way to \
                  act on the scene: loading structures, changing representations, colouring, \
@@ -93,7 +93,7 @@ pub fn schemas(allow_python: bool) -> Vec<Tool> {
                 "required": ["commands"],
             }),
         },
-        Tool {
+        ToolSpec {
             name: SCREENSHOT.to_string(),
             description: "Capture the current viewport and return it as an image. Call this to \
                  check your own work after changing the scene, to answer questions about how \
@@ -109,7 +109,7 @@ pub fn schemas(allow_python: bool) -> Vec<Tool> {
                 },
             }),
         },
-        Tool {
+        ToolSpec {
             name: GET_SCENE_STATE.to_string(),
             description: "List what is currently loaded: object names and types, which are \
                  enabled, atom counts, named selections and their expressions, and the viewport \
@@ -118,7 +118,7 @@ pub fn schemas(allow_python: bool) -> Vec<Tool> {
                 .to_string(),
             input_schema: json!({"type": "object", "properties": {}}),
         },
-        Tool {
+        ToolSpec {
             name: GET_SEQUENCES.to_string(),
             description: "Get residue sequences in FASTA format for loaded structures. Call this \
                  for any question about sequence, chain composition, chain lengths, or residue \
@@ -132,7 +132,7 @@ pub fn schemas(allow_python: bool) -> Vec<Tool> {
                 },
             }),
         },
-        Tool {
+        ToolSpec {
             name: COUNT_ATOMS.to_string(),
             description: "Count the atoms matching a selection expression. This is cheap — call \
                  it to validate a selection expression before using it in a command, especially \
@@ -152,7 +152,7 @@ pub fn schemas(allow_python: bool) -> Vec<Tool> {
     ];
 
     if allow_python {
-        tools.push(Tool {
+        tools.push(ToolSpec {
             name: RUN_PYTHON.to_string(),
             description: "Execute Python inside the viewer's embedded interpreter, where `cmd` \
                  is the Patinae command API. Use this when a task needs logic that plain \

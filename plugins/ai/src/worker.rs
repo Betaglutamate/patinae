@@ -12,12 +12,9 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::api::types::{
-    AssistantTurn, ContentBlock, Message, MessagesRequest, OutputConfig, StopReason, SystemBlock,
-    ToolResultContent, DEFAULT_MODEL,
+use crate::provider::{
+    self, ApiError, AssistantTurn, Part, Provider, ProviderId, StopReason, Turn, TurnRequest,
 };
-use crate::api::{self, ApiError};
-use crate::auth;
 use crate::settings::DEFAULT_EFFORT;
 use crate::tools;
 
@@ -31,6 +28,7 @@ const RECV_TICK: Duration = Duration::from_millis(200);
 /// Runtime configuration, snapshotted from settings on each turn.
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub provider: ProviderId,
     pub model: String,
     pub effort: String,
     pub max_tokens: u32,
@@ -44,7 +42,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            model: DEFAULT_MODEL.to_string(),
+            provider: ProviderId::Claude,
+            model: ProviderId::Claude.default_model().to_string(),
             effort: DEFAULT_EFFORT.to_string(),
             max_tokens: 64_000,
             allow_python: true,
@@ -61,7 +60,8 @@ pub enum ToWorker {
     /// The outcome of a tool call the worker requested.
     ToolResult {
         call_id: String,
-        content: Vec<ToolResultContent>,
+        name: String,
+        content: Vec<Part>,
         is_error: bool,
     },
     /// Refresh the config snapshot (settings changed, or the command inventory
@@ -140,9 +140,9 @@ struct Worker {
     tx: Sender<FromWorker>,
     cancel: Arc<AtomicBool>,
     config: Config,
-    history: Vec<Message>,
+    history: Vec<Turn>,
     runtime: Option<tokio::runtime::Runtime>,
-    client: Option<reqwest::Client>,
+    provider: Option<Box<dyn Provider>>,
 }
 
 impl Worker {
@@ -154,7 +154,7 @@ impl Worker {
             config: Config::default(),
             history: Vec::new(),
             runtime: None,
-            client: None,
+            provider: None,
         }
     }
 
@@ -171,7 +171,7 @@ impl Worker {
         while let Ok(msg) = self.rx.recv() {
             match msg {
                 ToWorker::Prompt(p) => self.run_turn(p),
-                ToWorker::Config(c) => self.config = *c,
+                ToWorker::Config(c) => self.apply_config(*c),
                 ToWorker::Login => self.do_login(),
                 ToWorker::Logout => self.do_logout(),
                 ToWorker::RefreshAuth => self.report_auth(),
@@ -186,20 +186,53 @@ impl Worker {
         }
     }
 
-    fn report_auth(&self) {
-        self.send(FromWorker::Status(auth::state().describe().to_string()));
+    /// Adopt a new config, rebuilding the provider if it changed.
+    ///
+    /// Switching provider invalidates reasoning blocks in the history, which
+    /// are meaningless (and sometimes rejected) by the other vendor.
+    fn apply_config(&mut self, config: Config) {
+        let switched = config.provider != self.config.provider;
+        self.config = config;
+        if switched {
+            self.provider = None;
+            provider::sanitize_history(&mut self.history, self.config.provider);
+            self.report_auth();
+        }
     }
 
-    fn do_login(&self) {
+    fn report_auth(&mut self) {
+        let status = match self.ensure_provider() {
+            Ok(p) => p.auth().status().message,
+            Err(e) => e.to_string(),
+        };
+        self.send(FromWorker::Status(status));
+    }
+
+    /// Build the active provider on demand.
+    fn ensure_provider(&mut self) -> Result<&mut Box<dyn Provider>, ApiError> {
+        if self.provider.is_none() {
+            self.provider = Some(provider::build(self.config.provider)?);
+        }
+        Ok(self.provider.as_mut().expect("just built"))
+    }
+
+    fn do_login(&mut self) {
         self.send(FromWorker::Status(
             "Signing in — check your browser…".to_string(),
         ));
-        match auth::login() {
+        let result = match self.ensure_provider() {
+            Ok(p) => p.auth().login(),
+            Err(e) => {
+                self.note(format!("Sign-in failed: {e}"));
+                return;
+            }
+        };
+        match result {
             Ok(output) => {
                 if !output.trim().is_empty() {
                     self.note(output);
                 }
-                self.send(FromWorker::Status("Signed in.".to_string()));
+                self.report_auth();
             }
             Err(e) => {
                 self.note(format!("Sign-in failed: {e}"));
@@ -208,9 +241,12 @@ impl Worker {
         }
     }
 
-    fn do_logout(&self) {
-        if let Err(e) = auth::logout() {
-            self.note(format!("Sign-out failed: {e}"));
+    fn do_logout(&mut self) {
+        let result = self.ensure_provider().map(|p| p.auth().logout());
+        match result {
+            Ok(Err(e)) => self.note(format!("Sign-out failed: {e}")),
+            Err(e) => self.note(format!("Sign-out failed: {e}")),
+            Ok(Ok(())) => {}
         }
         self.report_auth();
     }
@@ -226,9 +262,7 @@ impl Worker {
                     .map_err(|e| format!("failed to start async runtime: {e}"))?,
             );
         }
-        if self.client.is_none() {
-            self.client = Some(api::build_client().map_err(|e| e.to_string())?);
-        }
+        self.ensure_provider().map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -243,7 +277,7 @@ impl Worker {
             return;
         }
 
-        self.history.push(Message::user_text(prompt));
+        self.history.push(Turn::user_text(prompt));
 
         for iteration in 0..MAX_ITERATIONS {
             if self.cancelled() {
@@ -261,23 +295,20 @@ impl Worker {
 
             // Append the full content — dropping tool_use or thinking blocks
             // here would invalidate the next request.
-            if !turn.content.is_empty() {
-                self.history.push(Message::assistant(turn.content.clone()));
+            if !turn.parts.is_empty() {
+                self.history.push(Turn::model(turn.parts.clone()));
             }
 
-            match turn.stop_reason {
+            match turn.stop.clone() {
                 Some(StopReason::ToolUse) => match self.dispatch_tools(&turn) {
-                    Some(results) => self.history.push(Message::user(results)),
+                    Some(results) => self.history.push(Turn::user(results)),
                     None => break, // cancelled or shut down mid-flight
                 },
-                Some(StopReason::PauseTurn) => continue,
-                Some(StopReason::Refusal) => {
-                    let detail = turn
-                        .stop_details
-                        .as_ref()
-                        .and_then(|d| d.explanation.clone())
-                        .unwrap_or_else(|| "no explanation provided".to_string());
-                    self.note(format!("Claude declined this request ({detail})."));
+                Some(StopReason::Paused) => continue,
+                Some(StopReason::Refused { detail }) => {
+                    let detail = detail.unwrap_or_else(|| "no explanation given".to_string());
+                    let who = self.config.provider.display_name();
+                    self.note(format!("{who} declined this request ({detail})."));
                     break;
                 }
                 Some(StopReason::MaxTokens) => {
@@ -310,8 +341,10 @@ impl Worker {
     fn request(&mut self) -> Result<AssistantTurn, String> {
         match self.request_once() {
             Err(ApiError::Unauthorized(_)) => {
-                // The cached token may simply have aged out; force a refresh.
-                auth::invalidate_cache();
+                // The cached credential may simply have aged out; force a refresh.
+                if let Some(p) = self.provider.as_ref() {
+                    p.auth().invalidate();
+                }
                 self.request_once().map_err(|e| e.to_string())
             }
             other => other.map_err(|e| e.to_string()),
@@ -319,35 +352,32 @@ impl Worker {
     }
 
     fn request_once(&mut self) -> Result<AssistantTurn, ApiError> {
-        let token = auth::access_token().map_err(|e| ApiError::Unauthorized(e.to_string()))?;
+        let tools = tools::schemas(self.config.allow_python);
+        let config = self.config.clone();
+        let tx = self.tx.clone();
 
-        let request = MessagesRequest {
-            model: self.config.model.clone(),
-            max_tokens: self.config.max_tokens,
-            messages: self.history.clone(),
-            system: if self.config.system_prompt.is_empty() {
-                vec![]
-            } else {
-                vec![SystemBlock::cached(&self.config.system_prompt)]
-            },
-            tools: tools::schemas(self.config.allow_python),
-            output_config: Some(OutputConfig {
-                effort: Some(self.config.effort.clone()),
-            }),
-            stream: true,
+        // Take the runtime out so the provider can be borrowed mutably at the
+        // same time; both live on this thread, so this is bookkeeping only.
+        let runtime = self.runtime.take().expect("runtime initialised");
+        let history = std::mem::take(&mut self.history);
+
+        let request = TurnRequest {
+            model: &config.model,
+            system: &config.system_prompt,
+            effort: &config.effort,
+            max_tokens: config.max_tokens,
+            history: &history,
+            tools: &tools,
         };
 
-        let client = self.client.as_ref().expect("transport initialised").clone();
-        let tx = self.tx.clone();
-        let runtime = self.runtime.as_ref().expect("runtime initialised");
-
-        runtime.block_on(async move {
-            api::stream_message(&client, &token, &request, |event| {
-                use crate::api::stream::TurnEvent;
+        let who = config.provider.display_name();
+        let result = self.ensure_provider().and_then(|p| {
+            p.send_turn(&runtime, &request, &mut |event| {
+                use crate::provider::TurnEvent;
                 let msg = match event {
                     TurnEvent::TextDelta(t) => Some(FromWorker::TextDelta(t)),
-                    TurnEvent::ThinkingStarted => {
-                        Some(FromWorker::Status("Claude is thinking…".to_string()))
+                    TurnEvent::ReasoningStarted => {
+                        Some(FromWorker::Status(format!("{who} is thinking…")))
                     }
                     TurnEvent::ToolUseStarted { name } => {
                         Some(FromWorker::Status(format!("Running {name}…")))
@@ -359,8 +389,11 @@ impl Worker {
                     let _ = tx.send(msg);
                 }
             })
-            .await
-        })
+        });
+
+        self.runtime = Some(runtime);
+        self.history = history;
+        result
     }
 
     /// Emit every tool call in the turn, then wait for all their results.
@@ -368,9 +401,9 @@ impl Worker {
     /// Returns `None` if the turn was cancelled or the channel closed — the API
     /// requires a result for every `tool_use` block, so a partial set is
     /// unusable and the turn must be abandoned instead.
-    fn dispatch_tools(&mut self, turn: &AssistantTurn) -> Option<Vec<ContentBlock>> {
+    fn dispatch_tools(&mut self, turn: &AssistantTurn) -> Option<Vec<Part>> {
         let calls: Vec<(String, String)> = turn
-            .tool_uses()
+            .tool_calls()
             .into_iter()
             .map(|(id, name, input)| {
                 self.send(FromWorker::ToolCall {
@@ -382,7 +415,7 @@ impl Worker {
             })
             .collect();
 
-        let mut results: Vec<ContentBlock> = Vec::with_capacity(calls.len());
+        let mut results: Vec<Part> = Vec::with_capacity(calls.len());
         while results.len() < calls.len() {
             if self.cancelled() {
                 self.note("Stopped.");
@@ -391,26 +424,20 @@ impl Worker {
             match self.rx.recv_timeout(RECV_TICK) {
                 Ok(ToWorker::ToolResult {
                     call_id,
+                    name,
                     content,
                     is_error,
                 }) => {
-                    results.push(if is_error {
-                        let text = content
-                            .iter()
-                            .filter_map(|c| match c {
-                                ToolResultContent::Text { text } => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        ContentBlock::tool_err(call_id, text)
-                    } else {
-                        ContentBlock::tool_ok(call_id, content)
+                    results.push(Part::ToolResult {
+                        id: call_id,
+                        name,
+                        content,
+                        is_error,
                     });
                 }
                 // Config updates are safe to apply mid-turn; they take effect
                 // on the next request.
-                Ok(ToWorker::Config(c)) => self.config = *c,
+                Ok(ToWorker::Config(c)) => self.apply_config(*c),
                 Ok(ToWorker::Shutdown) => return None,
                 Ok(_) => {}
                 Err(RecvTimeoutError::Timeout) => continue,
