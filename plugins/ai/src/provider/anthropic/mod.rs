@@ -11,10 +11,23 @@ pub mod types;
 use serde_json::Value;
 
 use super::{
-    ApiError, AssistantTurn, Part, Provider, ProviderId, Role, StopReason, ToolSpec, Turn,
-    TurnEvent, TurnRequest, Usage,
+    ApiError, AssistantTurn, ModelInfo, Origin, Part, Provider, ProviderId, Role, StopReason,
+    ToolSpec, Turn, TurnEvent, TurnRequest, Usage,
 };
 use crate::auth::{ant::AntBroker, AuthBroker, Credential};
+
+/// Offline fallback catalogue.
+///
+/// `GET /v1/models` is the normal source; this covers the not-yet-signed-in
+/// case. Anthropic publishes no capability metadata, so every current model is
+/// described with the defaults — all of them call tools, read images and think.
+pub fn builtin_models() -> Vec<ModelInfo> {
+    vec![
+        ModelInfo::new(types::DEFAULT_MODEL, "Claude Sonnet 5"),
+        ModelInfo::new("claude-opus-5", "Claude Opus 5"),
+        ModelInfo::new("claude-haiku-4-5-20251001", "Claude Haiku 4.5"),
+    ]
+}
 
 pub struct AnthropicProvider {
     client: reqwest::Client,
@@ -87,7 +100,23 @@ impl Provider for AnthropicProvider {
             http::stream_message(&client, &token, &wire, |e| on_event(to_neutral_event(e))).await
         })?;
 
-        Ok(to_neutral_turn(turn))
+        // Tagged with the *requested* model, not the one the response reports.
+        // Anthropic resolves an alias like `claude-sonnet-5` to a dated id in
+        // its reply, and tagging with that would make every block look foreign
+        // to the next turn's check and be discarded immediately.
+        Ok(to_neutral_turn(turn, request.model))
+    }
+
+    fn models(&self, runtime: &tokio::runtime::Runtime) -> Result<Vec<ModelInfo>, ApiError> {
+        let Ok(Credential::Bearer(token)) = self.broker.credential() else {
+            return Ok(builtin_models());
+        };
+        let client = self.client.clone();
+        match runtime.block_on(async move { http::list_models(&client, &token).await }) {
+            Ok(models) if !models.is_empty() => Ok(models),
+            // An unreachable catalogue must degrade the picker, not break it.
+            _ => Ok(builtin_models()),
+        }
     }
 }
 
@@ -131,8 +160,12 @@ fn to_wire_block(part: &Part) -> Option<types::ContentBlock> {
         },
         // Replayed verbatim — the API rejects edited thinking blocks. A block
         // we can no longer parse is dropped rather than sent malformed.
-        Part::Reasoning { provider, raw } => {
-            if *provider != ProviderId::Claude {
+        //
+        // `sanitize_history` has already discarded anything from another model;
+        // this is the last-resort guard against a foreign block reaching the
+        // wire if that ever fails to run.
+        Part::Reasoning { origin, raw } => {
+            if origin.provider != ProviderId::Claude {
                 return None;
             }
             serde_json::from_value::<types::ContentBlock>(raw.clone()).ok()?
@@ -157,9 +190,9 @@ fn to_wire_result_part(part: &Part) -> Option<types::ToolResultContent> {
 // Wire -> neutral
 // =============================================================================
 
-fn to_neutral_turn(turn: types::AssistantTurn) -> AssistantTurn {
+fn to_neutral_turn(turn: types::AssistantTurn, requested_model: &str) -> AssistantTurn {
     let reasoning = |block: &types::ContentBlock| Part::Reasoning {
-        provider: ProviderId::Claude,
+        origin: Origin::new(ProviderId::Claude, requested_model),
         raw: serde_json::to_value(block).unwrap_or(Value::Null),
     };
 
@@ -303,7 +336,7 @@ mod tests {
     #[test]
     fn reasoning_from_another_provider_is_dropped_not_mangled() {
         let foreign = Part::Reasoning {
-            provider: ProviderId::Gemini,
+            origin: Origin::new(ProviderId::Gemini, "gemini-2.5-pro"),
             raw: json!({"thoughtSignature": "g"}),
         };
         assert!(to_wire_block(&foreign).is_none());
@@ -316,12 +349,36 @@ mod tests {
             thinking: String::new(),
             signature: "sig-abc".into(),
         };
-        let neutral = to_neutral_turn(types::AssistantTurn {
-            content: vec![original.clone()],
-            ..Default::default()
-        });
+        let neutral = to_neutral_turn(
+            types::AssistantTurn {
+                content: vec![original.clone()],
+                ..Default::default()
+            },
+            types::DEFAULT_MODEL,
+        );
         let back = to_wire_block(&neutral.parts[0]).unwrap();
         assert_eq!(back, original);
+    }
+
+    #[test]
+    fn reasoning_is_tagged_with_the_requested_model_not_the_resolved_one() {
+        // Anthropic answers an alias request with a dated id. Tagging with the
+        // reply would make every block look foreign on the very next turn.
+        let neutral = to_neutral_turn(
+            types::AssistantTurn {
+                content: vec![types::ContentBlock::Thinking {
+                    thinking: String::new(),
+                    signature: "sig".into(),
+                }],
+                model: "claude-sonnet-5-20250929".to_string(),
+                ..Default::default()
+            },
+            "claude-sonnet-5",
+        );
+        match &neutral.parts[0] {
+            Part::Reasoning { origin, .. } => assert_eq!(origin.model, "claude-sonnet-5"),
+            other => panic!("expected reasoning, got {other:?}"),
+        }
     }
 
     #[test]
@@ -351,15 +408,18 @@ mod tests {
 
     #[test]
     fn cache_reads_are_reported_as_cached_input_tokens() {
-        let neutral = to_neutral_turn(types::AssistantTurn {
-            usage: types::Usage {
-                input_tokens: 10,
-                output_tokens: 5,
-                cache_read_input_tokens: 900,
-                cache_creation_input_tokens: 0,
+        let neutral = to_neutral_turn(
+            types::AssistantTurn {
+                usage: types::Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    cache_read_input_tokens: 900,
+                    cache_creation_input_tokens: 0,
+                },
+                ..Default::default()
             },
-            ..Default::default()
-        });
+            types::DEFAULT_MODEL,
+        );
         assert_eq!(neutral.usage.cached_input_tokens, 900);
     }
 

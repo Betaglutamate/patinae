@@ -1,7 +1,7 @@
 //! AI agent plugin for Patinae.
 //!
-//! Puts an AI agent inside the viewer: the user signs in with their Claude or
-//! Google account, asks for something in natural language, and the agent drives
+//! Puts an AI agent inside the viewer: the user signs in with Anthropic, Google
+//! or OpenRouter, asks for something in natural language, and the agent drives
 //! the scene directly — issuing Patinae commands, running Python, reading loaded
 //! structures and sequence data, and looking at screenshots to verify its work.
 //!
@@ -10,15 +10,24 @@
 //! Two threads, connected by channels:
 //!
 //! - A **worker thread** ([`worker`]) owns a Tokio runtime and talks to the
-//!   Messages API. It never touches viewer state.
+//!   active provider's API. It never touches viewer state.
 //! - The **main thread** ([`handler`]) drains the worker in
 //!   `MessageHandler::poll` and applies every tool call through `PollContext`,
 //!   which is the only sanctioned way for a plugin to reach the viewer.
 //!
-//! Neither vendor ships a Rust SDK, so [`provider`] speaks raw HTTPS and decodes
-//! each vendor's SSE stream by hand behind a common trait.
+//! No vendor ships a Rust SDK, so [`provider`] speaks raw HTTPS and decodes each
+//! vendor's SSE stream by hand behind a common trait.
+//!
+//! # Switching model
+//!
+//! Which provider and model are active is held entirely in the host's settings
+//! registry — never mirrored into plugin state. The panel's dropdowns and
+//! `set ai_provider` at the command line therefore write the same place and read
+//! the same place, and [`handler`] notices the change on its next poll. Adding a
+//! second copy of that state anywhere is what would make the two disagree.
 
 pub mod auth;
+pub mod catalogue;
 pub mod handler;
 pub mod panel;
 pub mod prompt;
@@ -48,7 +57,7 @@ fn shared_state() -> Shared {
 
 patinae_plugin! {
     name: "ai",
-    description: "AI agent (Claude or Gemini): drives the viewer from natural language",
+    description: "AI agent (Claude, Gemini, OpenRouter): drives the viewer from natural language",
     commands: [AiCommand],
     panels: [panel::ChatPanel::new(shared_state())],
     settings: [settings::AiSettings],
@@ -79,7 +88,7 @@ impl Command for AiCommand {
     /// Provider names are accepted as aliases purely for discoverability —
     /// they do not switch provider. Use `set ai_provider` for that.
     fn aliases(&self) -> &[&str] {
-        &["claude", "gemini"]
+        &["claude", "gemini", "openrouter"]
     }
 
     fn execute<'v, 'r>(

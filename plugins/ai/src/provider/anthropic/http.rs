@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use super::accum::{TurnAccumulator, TurnEvent};
 use super::types;
-use crate::provider::ApiError;
+use crate::provider::{ApiError, ModelInfo};
 use crate::sse::SseDecoder;
 
 /// Anthropic Messages endpoint.
@@ -18,6 +18,9 @@ use crate::sse::SseDecoder;
 /// user's OAuth bearer token, so a configurable base URL would be a way to point
 /// that credential at an arbitrary host.
 pub const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
+
+/// Model catalogue endpoint. Hardcoded for the same reason as [`MESSAGES_URL`].
+pub const MODELS_URL: &str = "https://api.anthropic.com/v1/models?limit=100";
 
 /// Wire version pinned by the Messages API.
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -122,4 +125,97 @@ pub async fn stream_message(
     }
 
     Ok(acc.finish())
+}
+
+/// Fetch the model catalogue.
+///
+/// Anthropic publishes ids and display names but no capability metadata, so the
+/// entries carry [`ModelInfo`]'s optimistic defaults — which are correct for
+/// every model the endpoint currently returns.
+pub async fn list_models(
+    client: &reqwest::Client,
+    token: &str,
+) -> Result<Vec<ModelInfo>, ApiError> {
+    let response = client
+        .get(MODELS_URL)
+        .bearer_auth(token)
+        .header("anthropic-version", ANTHROPIC_VERSION)
+        .header("anthropic-beta", OAUTH_BETA)
+        .send()
+        .await
+        .map_err(|e| ApiError::Network(e.to_string()))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(ApiError::Http {
+            status: status.as_u16(),
+            body: response.text().await.unwrap_or_default(),
+        });
+    }
+
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| ApiError::Network(e.to_string()))?;
+
+    Ok(parse_models(&body))
+}
+
+/// Extract the catalogue from a `/v1/models` body. Split out so it is testable
+/// without a network round trip.
+pub fn parse_models(body: &serde_json::Value) -> Vec<ModelInfo> {
+    body.get("data")
+        .and_then(|d| d.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|m| {
+                    let id = m.get("id")?.as_str()?;
+                    let label = m
+                        .get("display_name")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or(id)
+                        .to_string();
+                    Some(ModelInfo::new(id, label))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn models_are_parsed_with_their_display_names() {
+        let body = json!({
+            "data": [
+                {"type": "model", "id": "claude-sonnet-5", "display_name": "Claude Sonnet 5"},
+                {"type": "model", "id": "claude-opus-5", "display_name": "Claude Opus 5"},
+            ],
+            "has_more": false,
+        });
+        let models = parse_models(&body);
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "claude-sonnet-5");
+        assert_eq!(models[0].label, "Claude Sonnet 5");
+        assert!(models[0].tools, "Anthropic models all call tools");
+    }
+
+    #[test]
+    fn a_model_without_a_display_name_falls_back_to_its_id() {
+        let body = json!({"data": [{"id": "claude-future-9"}]});
+        assert_eq!(parse_models(&body)[0].label, "claude-future-9");
+    }
+
+    #[test]
+    fn an_unexpected_body_yields_no_models_rather_than_panicking() {
+        assert!(parse_models(&json!({})).is_empty());
+        assert!(parse_models(&json!({"data": "nonsense"})).is_empty());
+        // A malformed entry is skipped without discarding its neighbours.
+        let mixed = json!({"data": [{"no_id": true}, {"id": "claude-sonnet-5"}]});
+        assert_eq!(parse_models(&mixed).len(), 1);
+    }
 }

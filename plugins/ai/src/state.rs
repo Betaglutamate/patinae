@@ -7,6 +7,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::provider::{ModelInfo, ProviderId};
+
 /// One line in the transcript.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Entry {
@@ -17,14 +19,6 @@ pub enum Entry {
 }
 
 impl Entry {
-    pub fn prefix(&self) -> &'static str {
-        match self {
-            Entry::User(_) => "You: ",
-            Entry::Assistant(_) => "Claude: ",
-            Entry::Note(_) => "• ",
-        }
-    }
-
     pub fn body(&self) -> &str {
         match self {
             Entry::User(t) | Entry::Assistant(t) | Entry::Note(t) => t,
@@ -50,6 +44,31 @@ pub struct SharedState {
     pub input: String,
     pub pending: Option<Pending>,
 
+    /// How the assistant is labelled in the transcript. Follows the active
+    /// provider, because a transcript that says "Claude:" while Gemini is
+    /// answering is simply wrong.
+    pub assistant_label: String,
+
+    /// The active provider's catalogue, and which provider it describes.
+    ///
+    /// Tagged so a fetch that lands after the user switched away is discarded
+    /// rather than shown against the wrong provider.
+    pub models: Vec<ModelInfo>,
+    pub models_provider: Option<ProviderId>,
+
+    /// Free text narrowing the model picker. Transient UI state, deliberately
+    /// not a setting — nobody wants their filter box restored at startup.
+    pub model_filter: String,
+
+    /// Set by the panel the first time it renders, and never cleared.
+    ///
+    /// The catalogue is only worth fetching once someone can see the picker.
+    /// `poll()` runs from startup whether or not the panel was ever opened, so
+    /// without this gate every Patinae launch would build a Tokio runtime and
+    /// make a network call for a dropdown nobody is looking at — undoing the
+    /// laziness the worker is careful about elsewhere.
+    pub panel_shown: bool,
+
     // --- requests raised by panel callbacks, consumed by the handler ---
     pub submit: Option<String>,
     pub decision: Option<bool>,
@@ -67,8 +86,26 @@ impl SharedState {
     pub fn new() -> Self {
         Self {
             status: "Checking sign-in…".to_string(),
+            assistant_label: ProviderId::Claude.display_name().to_string(),
             ..Default::default()
         }
+    }
+
+    /// The label an entry is rendered behind.
+    ///
+    /// Lives here rather than on [`Entry`] because the assistant's name depends
+    /// on which provider is active, which an entry does not know.
+    pub fn prefix(&self, entry: &Entry) -> String {
+        match entry {
+            Entry::User(_) => "You: ".to_string(),
+            Entry::Assistant(_) => format!("{}: ", self.assistant_label),
+            Entry::Note(_) => "\u{2022} ".to_string(),
+        }
+    }
+
+    /// Capability metadata for `id`, if the catalogue describes it.
+    pub fn model_info(&self, id: &str) -> Option<&ModelInfo> {
+        self.models.iter().find(|m| m.id == id)
     }
 
     /// Append streamed assistant text, merging into the current assistant entry
@@ -96,7 +133,7 @@ impl SharedState {
         }
         self.transcript
             .iter()
-            .map(|e| format!("{}{}", e.prefix(), e.body()))
+            .map(|e| format!("{}{}", self.prefix(e), e.body()))
             .collect::<Vec<_>>()
             .join("\n\n")
     }
@@ -145,6 +182,23 @@ mod tests {
         let out = s.render();
         assert!(out.contains("You: hi"));
         assert!(out.contains("Claude: hello"));
+    }
+
+    #[test]
+    fn the_assistant_is_labelled_with_whichever_provider_is_answering() {
+        // A transcript that says "Claude:" while Gemini answers is just wrong.
+        let mut s = SharedState::new();
+        s.assistant_label = "Gemini".into();
+        s.push(Entry::Assistant("hello".into()));
+        assert!(s.render().contains("Gemini: hello"));
+    }
+
+    #[test]
+    fn model_info_is_looked_up_by_id() {
+        let mut s = SharedState::new();
+        s.models = vec![crate::provider::ModelInfo::new("a/b", "A B")];
+        assert_eq!(s.model_info("a/b").map(|m| m.label.as_str()), Some("A B"));
+        assert!(s.model_info("nope").is_none());
     }
 
     #[test]

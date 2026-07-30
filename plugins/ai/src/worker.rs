@@ -13,7 +13,8 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::provider::{
-    self, ApiError, AssistantTurn, Part, Provider, ProviderId, StopReason, Turn, TurnRequest,
+    self, ApiError, AssistantTurn, ModelInfo, Origin, Part, Provider, ProviderId, StopReason, Turn,
+    TurnRequest,
 };
 use crate::settings::DEFAULT_EFFORT;
 use crate::tools;
@@ -73,6 +74,8 @@ pub enum ToWorker {
     Logout,
     /// Re-check auth state and report it.
     RefreshAuth,
+    /// Send back the active provider's model catalogue.
+    ListModels,
     /// Drop conversation history.
     Reset,
     Shutdown,
@@ -89,11 +92,20 @@ pub enum FromWorker {
     TextDelta(String),
     /// An out-of-band note for the transcript (tool calls, errors, refusals).
     Note(String),
-    /// Claude wants a tool executed on the main thread.
+    /// The model wants a tool executed on the main thread.
     ToolCall {
         call_id: String,
         name: String,
         input: Box<Value>,
+    },
+    /// The model catalogue for one provider.
+    ///
+    /// Tagged with the provider it describes, because a slow fetch can land
+    /// after the user has already switched away — and populating the picker
+    /// with another vendor's models would be worse than leaving it stale.
+    Models {
+        provider: ProviderId,
+        models: Vec<ModelInfo>,
     },
     /// The turn finished (successfully or not).
     TurnDone,
@@ -143,6 +155,8 @@ struct Worker {
     history: Vec<Turn>,
     runtime: Option<tokio::runtime::Runtime>,
     provider: Option<Box<dyn Provider>>,
+    /// A catalogue request that arrived mid-turn, serviced once the turn ends.
+    models_requested: bool,
 }
 
 impl Worker {
@@ -155,6 +169,7 @@ impl Worker {
             history: Vec::new(),
             runtime: None,
             provider: None,
+            models_requested: false,
         }
     }
 
@@ -175,6 +190,7 @@ impl Worker {
                 ToWorker::Login => self.do_login(),
                 ToWorker::Logout => self.do_logout(),
                 ToWorker::RefreshAuth => self.report_auth(),
+                ToWorker::ListModels => self.report_models(),
                 ToWorker::Reset => {
                     self.history.clear();
                     self.note("Conversation cleared.");
@@ -186,26 +202,107 @@ impl Worker {
         }
     }
 
+    /// The provider and model the next request will use.
+    fn origin(&self) -> Origin {
+        Origin::new(self.config.provider, self.config.model.clone())
+    }
+
     /// Adopt a new config, rebuilding the provider if it changed.
     ///
-    /// Switching provider invalidates reasoning blocks in the history, which
-    /// are meaningless (and sometimes rejected) by the other vendor.
+    /// Switching *model* invalidates reasoning blocks just as switching provider
+    /// does — a thinking signature is validated against the model that signed
+    /// it — so both are treated the same way. The provider object is rebuilt
+    /// only on a provider change, since that is the only thing it depends on.
     fn apply_config(&mut self, config: Config) {
-        let switched = config.provider != self.config.provider;
+        let switched_provider = config.provider != self.config.provider;
+        let switched_model = config.model != self.config.model;
+        let had_history = !self.history.is_empty();
+
         self.config = config;
-        if switched {
+        if switched_provider {
             self.provider = None;
-            provider::sanitize_history(&mut self.history, self.config.provider);
+        }
+        if switched_provider || switched_model {
+            let before = self.history.len();
+            let origin = self.origin();
+            provider::sanitize_history(&mut self.history, &origin);
+            // Say so rather than dropping context silently: the user is
+            // entitled to know the new model does not inherit the old one's
+            // reasoning, and a shortened history is otherwise invisible.
+            if had_history {
+                self.note(format!(
+                    "Switched to {} ({}). Earlier reasoning was dropped{}.",
+                    self.config.provider.display_name(),
+                    self.config.model,
+                    if before == self.history.len() {
+                        ""
+                    } else {
+                        ", along with turns that held nothing else"
+                    }
+                ));
+            }
+        }
+        if switched_provider {
             self.report_auth();
         }
     }
 
     fn report_auth(&mut self) {
+        // Prefer the provider's own richer line, but only when a runtime
+        // already exists — building one here would undo the laziness that keeps
+        // a user who never signs in from paying for a Tokio runtime.
+        let runtime = self.runtime.take();
         let status = match self.ensure_provider() {
-            Ok(p) => p.auth().status().message,
+            Ok(p) => {
+                let enriched = runtime.as_ref().and_then(|rt| p.status_line(rt));
+                enriched.unwrap_or_else(|| p.auth().status().message)
+            }
             Err(e) => e.to_string(),
         };
+        self.runtime = runtime;
         self.send(FromWorker::Status(status));
+    }
+
+    /// Send the active provider's catalogue, from cache when it is fresh.
+    ///
+    /// The cached answer goes out first and unconditionally, so the picker fills
+    /// immediately; only a stale or missing cache costs a fetch. A fetch that
+    /// fails falls back to the builtin list rather than reporting an error —
+    /// this feeds a dropdown, and an empty dropdown is a worse failure than a
+    /// short one.
+    fn report_models(&mut self) {
+        let id = self.config.provider;
+
+        if let Some(models) = crate::catalogue::load(id) {
+            self.send(FromWorker::Models {
+                provider: id,
+                models,
+            });
+            return;
+        }
+
+        if self.ensure_transport().is_err() {
+            self.send(FromWorker::Models {
+                provider: id,
+                models: id.builtin_models(),
+            });
+            return;
+        }
+
+        // Same dance as `request_once`: the runtime is moved out so the provider
+        // can be borrowed mutably alongside it. Both live on this thread.
+        let runtime = self.runtime.take().expect("transport initialised");
+        let models = self
+            .ensure_provider()
+            .and_then(|p| p.models(&runtime))
+            .unwrap_or_else(|_| id.builtin_models());
+        self.runtime = Some(runtime);
+
+        crate::catalogue::store(id, &models);
+        self.send(FromWorker::Models {
+            provider: id,
+            models,
+        });
     }
 
     /// Build the active provider on demand.
@@ -328,7 +425,12 @@ impl Worker {
         self.finish_turn();
     }
 
-    fn finish_turn(&self) {
+    fn finish_turn(&mut self) {
+        // Service a catalogue request that arrived mid-turn, now that the
+        // thread is free to block on it.
+        if std::mem::take(&mut self.models_requested) {
+            self.report_models();
+        }
         self.send(FromWorker::Busy(false));
         self.send(FromWorker::TurnDone);
     }
@@ -439,6 +541,11 @@ impl Worker {
                 // on the next request.
                 Ok(ToWorker::Config(c)) => self.apply_config(*c),
                 Ok(ToWorker::Shutdown) => return None,
+                // Deferred rather than dropped. Answering it here would mean a
+                // blocking HTTP fetch while the agent waits on a tool result,
+                // but dropping it strands the picker: the handler keeps one
+                // request open per provider and would never ask again.
+                Ok(ToWorker::ListModels) => self.models_requested = true,
                 Ok(_) => {}
                 Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => return None,
@@ -481,6 +588,33 @@ mod tests {
             handle.rx.recv_timeout(Duration::from_secs(5)),
             Ok(FromWorker::Status(_))
         ));
+        handle.tx.send(ToWorker::Shutdown).unwrap();
+    }
+
+    #[test]
+    fn a_catalogue_request_is_always_answered() {
+        // The handler holds one request open per provider, so a dropped
+        // ListModels strands the picker empty forever.
+        let handle = spawn();
+        let _ = handle.rx.recv_timeout(Duration::from_secs(5));
+        handle.tx.send(ToWorker::ListModels).unwrap();
+
+        let mut answered = false;
+        // Auth and status chatter can arrive first; the catalogue is what
+        // matters.
+        for _ in 0..10 {
+            match handle.rx.recv_timeout(Duration::from_secs(30)) {
+                Ok(FromWorker::Models { provider, models }) => {
+                    assert_eq!(provider, ProviderId::Claude);
+                    assert!(!models.is_empty(), "an empty picker is a broken picker");
+                    answered = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        assert!(answered, "ListModels went unanswered");
         handle.tx.send(ToWorker::Shutdown).unwrap();
     }
 
