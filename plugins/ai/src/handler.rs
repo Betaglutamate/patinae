@@ -51,6 +51,9 @@ pub struct ClaudeHandler {
     /// The command inventory is built from `ctx.registry()`, which is only
     /// reachable from a command — not from `poll()`.
     prompt_ready: bool,
+    /// Provider whose catalogue has been asked for but not yet delivered, so a
+    /// slow fetch is not re-requested on every poll.
+    pending_models: Option<crate::provider::ProviderId>,
 }
 
 impl ClaudeHandler {
@@ -62,6 +65,7 @@ impl ClaudeHandler {
             gated: VecDeque::new(),
             last_config: None,
             prompt_ready: false,
+            pending_models: None,
         }
     }
 
@@ -124,6 +128,46 @@ impl ClaudeHandler {
         if self.last_config.as_deref() != Some(fingerprint.as_str()) {
             self.last_config = Some(fingerprint);
             self.send_worker(ToWorker::Config(Box::new(config)));
+        }
+    }
+
+    /// Ask for the catalogue whenever the panel is showing one that belongs to
+    /// a different provider.
+    ///
+    /// Driven by the state of the cache rather than by the switch event, so a
+    /// provider changed with `set ai_provider` from the command line refreshes
+    /// the picker exactly as the dropdown does. `pending_models` keeps one
+    /// in-flight request per provider — without it, every poll between the
+    /// request and its answer would queue another.
+    ///
+    /// Gated on the panel having been rendered at least once: `poll()` runs from
+    /// startup regardless, and fetching a catalogue for a dropdown nobody has
+    /// opened would build a Tokio runtime and hit the network on every launch.
+    fn sync_models(&mut self, ctx: &mut PollContext<'_>) {
+        let id = settings::provider(ctx.shared);
+        let wanted = self
+            .state
+            .lock()
+            .map(|s| s.panel_shown && s.models_provider != Some(id))
+            .unwrap_or(false);
+
+        if wanted && self.pending_models != Some(id) {
+            self.pending_models = Some(id);
+            self.send_worker(ToWorker::ListModels);
+        }
+    }
+
+    /// Keep the transcript's assistant label matching the active provider.
+    ///
+    /// The panel sets this when the dropdown is used; this covers the other
+    /// route in, `set ai_provider` from the command line.
+    fn sync_assistant_label(&mut self, ctx: &mut PollContext<'_>) {
+        let label = settings::provider(ctx.shared).display_name();
+        if let Ok(mut s) = self.state.lock() {
+            if s.assistant_label != label {
+                s.assistant_label = label.to_string();
+                s.dirty = true;
+            }
         }
     }
 
@@ -237,6 +281,21 @@ impl ClaudeHandler {
                     name,
                     input,
                 } => self.dispatch_tool(ctx, &call_id, &name, &input),
+                FromWorker::Models { provider, models } => {
+                    // Discard a catalogue for a provider the user already
+                    // switched away from, rather than showing one vendor's
+                    // models under another's name.
+                    if self.pending_models == Some(provider) {
+                        self.pending_models = None;
+                    }
+                    if settings::provider(ctx.shared) == provider {
+                        if let Ok(mut s) = self.state.lock() {
+                            s.models = models;
+                            s.models_provider = Some(provider);
+                            s.dirty = true;
+                        }
+                    }
+                }
                 FromWorker::TurnDone => {
                     if let Ok(mut s) = self.state.lock() {
                         s.busy = false;
@@ -468,6 +527,8 @@ impl MessageHandler for ClaudeHandler {
 
     fn poll(&mut self, ctx: &mut PollContext<'_>) {
         self.sync_config(ctx);
+        self.sync_models(ctx);
+        self.sync_assistant_label(ctx);
         self.drain_command_results(ctx);
         self.drain_panel_requests(ctx);
         self.drain_worker(ctx);

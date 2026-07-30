@@ -2,23 +2,30 @@
 //!
 //! Everything above this module — the agent loop, tools, panel, transcript,
 //! prompt — is vendor-neutral. Everything below it translates to and from one
-//! vendor's wire format. Neither Anthropic nor Google ships a Rust SDK, so both
-//! sides are hand-written.
+//! vendor's wire format. None of the three vendors ships a Rust SDK, so every
+//! adapter is hand-written.
 //!
-//! The neutral conversation model is deliberately *not* either vendor's shape.
-//! Two details make it work across both:
+//! The neutral conversation model is deliberately *not* any one vendor's shape.
+//! Three details make it work across all of them:
 //!
-//! - **Tool calls carry both an `id` and a `name`.** Anthropic pairs results to
-//!   calls by id; Gemini's `functionResponse` wants the name as well. Carrying
-//!   both means neither provider has to invent one.
-//! - **Reasoning is opaque and provider-tagged.** Anthropic requires thinking
-//!   blocks to be echoed back byte-identically, and Gemini has its own
-//!   `thoughtSignature`. Neither is meaningful to the other, so [`Part::Reasoning`]
-//!   records which provider produced it and [`sanitize_history`] drops foreign
-//!   ones when the user switches. Both APIs tolerate their absence.
+//! - **Tool calls carry both an `id` and a `name`.** Anthropic and OpenRouter
+//!   pair results to calls by id; Gemini's `functionResponse` wants the name and
+//!   supplies no id at all. Carrying both means no provider has to invent one.
+//! - **Reasoning is opaque and tagged with its [`Origin`].** Anthropic requires
+//!   thinking blocks echoed back byte-identically, Gemini has its own
+//!   `thoughtSignature`, and OpenRouter forwards `reasoning_details` to whichever
+//!   upstream vendor issued them. None is meaningful to any other, so
+//!   [`sanitize_history`] drops foreign ones when the user switches. Every API
+//!   tolerates their absence.
+//! - **Capabilities are data, not assumptions.** [`ModelInfo`] carries what a
+//!   model can actually do, because on OpenRouter the answer varies per model
+//!   rather than per vendor.
 
 pub mod anthropic;
+pub mod gemini;
+pub mod openrouter;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::auth::AuthBroker;
@@ -28,6 +35,7 @@ use crate::auth::AuthBroker;
 pub enum ProviderId {
     Claude,
     Gemini,
+    OpenRouter,
 }
 
 impl ProviderId {
@@ -35,6 +43,7 @@ impl ProviderId {
         match self {
             ProviderId::Claude => "claude",
             ProviderId::Gemini => "gemini",
+            ProviderId::OpenRouter => "openrouter",
         }
     }
 
@@ -42,17 +51,24 @@ impl ProviderId {
         match self {
             ProviderId::Claude => "Claude",
             ProviderId::Gemini => "Gemini",
+            ProviderId::OpenRouter => "OpenRouter",
         }
     }
 
     /// Model used when the per-provider model setting is unset.
     ///
-    /// Per-provider rather than one global default: the two vendors' model names
+    /// Per-provider rather than one global default: the vendors' model names
     /// share no namespace, and users switch back and forth.
+    ///
+    /// OpenRouter defaults to a model that supports tools, images *and*
+    /// reasoning, so every feature of the plugin works on the first run. Picking
+    /// a cheaper model that cannot call tools would leave the agent inert with
+    /// no obvious explanation.
     pub fn default_model(self) -> &'static str {
         match self {
             ProviderId::Claude => anthropic::types::DEFAULT_MODEL,
-            ProviderId::Gemini => "gemini-2.5-pro",
+            ProviderId::Gemini => gemini::DEFAULT_MODEL,
+            ProviderId::OpenRouter => openrouter::DEFAULT_MODEL,
         }
     }
 
@@ -60,11 +76,30 @@ impl ProviderId {
         match raw.trim().to_ascii_lowercase().as_str() {
             "claude" | "anthropic" => Some(ProviderId::Claude),
             "gemini" | "google" => Some(ProviderId::Gemini),
+            "openrouter" | "open-router" | "or" => Some(ProviderId::OpenRouter),
             _ => None,
         }
     }
 
-    pub const ALL: [ProviderId; 2] = [ProviderId::Claude, ProviderId::Gemini];
+    /// Models to offer when the live catalogue cannot be reached.
+    ///
+    /// Every provider can list its models over HTTP, so this is a fallback for
+    /// the offline / not-yet-signed-in case rather than the normal path. It is
+    /// deliberately short: a stale hardcoded catalogue is worse than a small one,
+    /// and the model setting accepts any string regardless.
+    pub fn builtin_models(self) -> Vec<ModelInfo> {
+        match self {
+            ProviderId::Claude => anthropic::builtin_models(),
+            ProviderId::Gemini => gemini::builtin_models(),
+            ProviderId::OpenRouter => openrouter::builtin_models(),
+        }
+    }
+
+    pub const ALL: [ProviderId; 3] = [
+        ProviderId::Claude,
+        ProviderId::Gemini,
+        ProviderId::OpenRouter,
+    ];
 }
 
 // =============================================================================
@@ -77,6 +112,29 @@ pub enum Role {
     /// The assistant. Named after Gemini's wire value because "model" is the
     /// less ambiguous word once more than one vendor is in play.
     Model,
+}
+
+/// Which provider *and model* produced a piece of opaque reasoning.
+///
+/// Both halves matter. Anthropic validates a thinking block's signature against
+/// the model that signed it, Gemini does the same with `thoughtSignature`, and
+/// on OpenRouter a single provider spans every vendor at once — so provider
+/// alone cannot decide whether a block is safe to replay. Recording the model
+/// too means switching `claude_model` mid-conversation is handled by the same
+/// rule that handles switching vendor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Origin {
+    pub provider: ProviderId,
+    pub model: String,
+}
+
+impl Origin {
+    pub fn new(provider: ProviderId, model: impl Into<String>) -> Self {
+        Self {
+            provider,
+            model: model.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -97,10 +155,10 @@ pub enum Part {
         content: Vec<Part>,
         is_error: bool,
     },
-    /// Vendor-internal reasoning, replayed verbatim to the provider that
-    /// produced it and dropped for any other.
+    /// Vendor-internal reasoning, replayed verbatim to the model that produced
+    /// it and dropped for any other.
     Reasoning {
-        provider: ProviderId,
+        origin: Origin,
         raw: Value,
     },
 }
@@ -144,18 +202,18 @@ impl Turn {
     }
 }
 
-/// Drop reasoning parts belonging to a different provider.
+/// Drop reasoning parts that did not come from `active`.
 ///
-/// Called when the active provider changes mid-conversation. Without this we
-/// would send Anthropic thinking blocks to Gemini (or the reverse), which is at
-/// best ignored and at worst a 400.
-pub fn sanitize_history(history: &mut Vec<Turn>, active: ProviderId) {
+/// Called when the provider *or the model* changes mid-conversation. Without
+/// this we would send Anthropic thinking blocks to Gemini (or a Sonnet
+/// signature to Opus), which is at best ignored and at worst a 400.
+pub fn sanitize_history(history: &mut Vec<Turn>, active: &Origin) {
     for turn in history.iter_mut() {
         turn.parts
-            .retain(|p| !matches!(p, Part::Reasoning { provider, .. } if *provider != active));
+            .retain(|p| !matches!(p, Part::Reasoning { origin, .. } if origin != active));
     }
     // A turn that held nothing but foreign reasoning would now be empty, and
-    // both APIs reject empty content.
+    // every API rejects empty content.
     history.retain(|t| !t.parts.is_empty());
 }
 
@@ -271,6 +329,93 @@ impl std::fmt::Display for ApiError {
     }
 }
 
+// =============================================================================
+// Model catalogue
+// =============================================================================
+
+/// Published price in US dollars per million tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Price {
+    pub prompt: f64,
+    pub completion: f64,
+}
+
+/// One model, and what it can actually do.
+///
+/// Capabilities are carried as data rather than inferred from the provider,
+/// because on OpenRouter a single provider fronts hundreds of models whose
+/// support for tools, images and reasoning all differ. The panel uses these to
+/// filter the picker and to warn before a model is chosen that cannot drive the
+/// viewer at all.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelInfo {
+    pub id: String,
+    /// Human-readable name for the picker; falls back to the id.
+    pub label: String,
+    /// Context window in tokens, or `None` when the vendor does not publish it.
+    pub context_length: Option<u32>,
+    /// Whether the model can call tools. **The agent is inert without this**, so
+    /// it is the one capability the picker filters on rather than merely
+    /// displays.
+    pub tools: bool,
+    /// Whether the model accepts image input, i.e. whether `screenshot` works.
+    pub images: bool,
+    /// Whether the model exposes a reasoning/thinking mode.
+    pub reasoning: bool,
+    pub price: Option<Price>,
+}
+
+impl ModelInfo {
+    /// A model with no published capability metadata.
+    ///
+    /// Defaults are optimistic on purpose: this is used for the builtin
+    /// fallback lists and for a model the user typed by hand, where refusing to
+    /// offer a model we simply know nothing about is worse than offering it.
+    pub fn new(id: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+            context_length: None,
+            tools: true,
+            images: true,
+            reasoning: true,
+            price: None,
+        }
+    }
+
+    pub fn with_context(mut self, tokens: u32) -> Self {
+        self.context_length = Some(tokens);
+        self
+    }
+
+    /// A one-line capability summary for the panel.
+    pub fn badges(&self) -> String {
+        let mut parts = Vec::new();
+        parts.push(if self.tools {
+            "tools ✓"
+        } else {
+            "no tools ✗"
+        });
+        if self.images {
+            parts.push("vision ✓");
+        }
+        if self.reasoning {
+            parts.push("reasoning ✓");
+        }
+        let mut out = parts.join(" · ");
+        if let Some(ctx) = self.context_length {
+            out.push_str(&format!(" · {}k ctx", ctx / 1000));
+        }
+        if let Some(p) = self.price {
+            out.push_str(&format!(
+                " · ${:.2}/${:.2} per Mtok",
+                p.prompt, p.completion
+            ));
+        }
+        out
+    }
+}
+
 /// One vendor's implementation.
 ///
 /// Blocking on purpose: the worker owns the Tokio runtime and passes it in, so
@@ -287,17 +432,37 @@ pub trait Provider: Send {
         request: &TurnRequest<'_>,
         on_event: &mut dyn FnMut(TurnEvent),
     ) -> Result<AssistantTurn, ApiError>;
+
+    /// The models this provider can serve, newest-relevant first.
+    ///
+    /// Every vendor publishes a models endpoint, so the default is only reached
+    /// by a provider that has not overridden it. Implementations should fall
+    /// back to [`ProviderId::builtin_models`] rather than erroring: an
+    /// unreachable catalogue must degrade the picker, not break it.
+    fn models(&self, _runtime: &tokio::runtime::Runtime) -> Result<Vec<ModelInfo>, ApiError> {
+        Ok(self.id().builtin_models())
+    }
+
+    /// A status line better than the credential broker can produce alone.
+    ///
+    /// The broker only knows whether it found a credential. A provider can go
+    /// further if the vendor exposes an endpoint describing it — OpenRouter
+    /// reports the key's label and remaining credit, which is the question
+    /// people actually have. Returning `None` keeps the broker's own answer.
+    ///
+    /// Only called when a runtime already exists, so a user who never signs in
+    /// still pays nothing for it.
+    fn status_line(&self, _runtime: &tokio::runtime::Runtime) -> Option<String> {
+        None
+    }
 }
 
 /// Construct the provider for `id`.
 pub fn build(id: ProviderId) -> Result<Box<dyn Provider>, ApiError> {
     match id {
         ProviderId::Claude => Ok(Box::new(anthropic::AnthropicProvider::new()?)),
-        // Gemini lands in the next commit; until then, selecting it is a clear
-        // error rather than a silent fallback to the other vendor.
-        ProviderId::Gemini => Err(ApiError::Network(
-            "the Gemini provider is not implemented yet; use `set ai_provider, claude`".to_string(),
-        )),
+        ProviderId::Gemini => Ok(Box::new(gemini::GeminiProvider::new()?)),
+        ProviderId::OpenRouter => Ok(Box::new(openrouter::OpenRouterProvider::new()?)),
     }
 }
 
@@ -317,6 +482,10 @@ mod tests {
     fn provider_parsing_accepts_vendor_aliases_and_is_case_insensitive() {
         assert_eq!(ProviderId::parse("Anthropic"), Some(ProviderId::Claude));
         assert_eq!(ProviderId::parse("  GOOGLE "), Some(ProviderId::Gemini));
+        assert_eq!(
+            ProviderId::parse(" OpenRouter "),
+            Some(ProviderId::OpenRouter)
+        );
         assert_eq!(ProviderId::parse("gpt"), None);
     }
 
@@ -324,6 +493,25 @@ mod tests {
     fn each_provider_defaults_to_its_own_model() {
         assert!(ProviderId::Claude.default_model().starts_with("claude"));
         assert!(ProviderId::Gemini.default_model().starts_with("gemini"));
+        // OpenRouter ids are always `vendor/model`.
+        assert!(ProviderId::OpenRouter.default_model().contains('/'));
+    }
+
+    #[test]
+    fn every_provider_offers_a_non_empty_offline_fallback() {
+        for id in ProviderId::ALL {
+            let models = id.builtin_models();
+            assert!(!models.is_empty(), "{} has no fallback", id.as_str());
+            assert!(
+                models.iter().any(|m| m.id == id.default_model()),
+                "{}'s default model is missing from its fallback list",
+                id.as_str()
+            );
+        }
+    }
+
+    fn claude_origin() -> Origin {
+        Origin::new(ProviderId::Claude, "claude-sonnet-5")
     }
 
     fn history_with_reasoning() -> Vec<Turn> {
@@ -331,7 +519,7 @@ mod tests {
             Turn::user_text("hi"),
             Turn::model(vec![
                 Part::Reasoning {
-                    provider: ProviderId::Claude,
+                    origin: claude_origin(),
                     raw: json!({"signature": "sig"}),
                 },
                 Part::text("hello"),
@@ -342,31 +530,63 @@ mod tests {
     #[test]
     fn switching_provider_drops_foreign_reasoning_but_keeps_the_prose() {
         let mut h = history_with_reasoning();
-        sanitize_history(&mut h, ProviderId::Gemini);
+        sanitize_history(&mut h, &Origin::new(ProviderId::Gemini, "gemini-2.5-pro"));
         assert_eq!(h[1].parts, vec![Part::text("hello")]);
     }
 
     #[test]
-    fn staying_on_the_same_provider_preserves_reasoning_verbatim() {
+    fn switching_model_within_one_provider_also_drops_reasoning() {
+        // A Sonnet thinking signature does not validate on Opus, so provider
+        // identity alone is not enough to decide this.
+        let mut h = history_with_reasoning();
+        sanitize_history(&mut h, &Origin::new(ProviderId::Claude, "claude-opus-5"));
+        assert_eq!(h[1].parts, vec![Part::text("hello")]);
+    }
+
+    #[test]
+    fn staying_on_the_same_model_preserves_reasoning_verbatim() {
         let mut h = history_with_reasoning();
         let before = h.clone();
-        sanitize_history(&mut h, ProviderId::Claude);
+        sanitize_history(&mut h, &claude_origin());
         assert_eq!(h, before);
     }
 
     #[test]
     fn turns_left_empty_by_sanitizing_are_removed() {
-        // Both APIs reject a turn with no content.
+        // Every API rejects a turn with no content.
         let mut h = vec![
             Turn::user_text("hi"),
             Turn::model(vec![Part::Reasoning {
-                provider: ProviderId::Claude,
+                origin: claude_origin(),
                 raw: json!({}),
             }]),
         ];
-        sanitize_history(&mut h, ProviderId::Gemini);
+        sanitize_history(&mut h, &Origin::new(ProviderId::Gemini, "gemini-2.5-pro"));
         assert_eq!(h.len(), 1);
         assert!(h.iter().all(|t| !t.parts.is_empty()));
+    }
+
+    #[test]
+    fn badges_lead_with_tool_support_and_flag_its_absence() {
+        let mut m = ModelInfo::new("x/y", "Y").with_context(200_000);
+        assert!(m.badges().starts_with("tools ✓"));
+        assert!(m.badges().contains("200k ctx"));
+
+        m.tools = false;
+        assert!(
+            m.badges().starts_with("no tools ✗"),
+            "a model that cannot drive the viewer must say so first"
+        );
+    }
+
+    #[test]
+    fn badges_quote_prices_per_million_tokens() {
+        let mut m = ModelInfo::new("x/y", "Y");
+        m.price = Some(Price {
+            prompt: 3.0,
+            completion: 15.0,
+        });
+        assert!(m.badges().contains("$3.00/$15.00 per Mtok"));
     }
 
     #[test]
@@ -390,7 +610,12 @@ mod tests {
     }
 
     #[test]
-    fn selecting_an_unimplemented_provider_errors_rather_than_silently_switching() {
-        assert!(build(ProviderId::Gemini).is_err());
+    fn every_provider_id_builds_an_adapter_reporting_that_same_id() {
+        // Guards against a `build` arm wired to the wrong adapter, which would
+        // silently send one vendor's traffic to another's credentials.
+        for id in ProviderId::ALL {
+            let provider = build(id).expect("every provider is implemented");
+            assert_eq!(provider.id(), id);
+        }
     }
 }

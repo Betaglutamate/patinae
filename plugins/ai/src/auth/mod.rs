@@ -1,16 +1,19 @@
 //! Credential brokering.
 //!
-//! The plugin stores no secret of its own. Each provider delegates to a vendor
-//! CLI that already owns the browser flow, the credential on disk, and refresh
-//! — `ant` for Anthropic, `gcloud` for Google — and we only ask for a
-//! short-lived credential when a request is about to go out.
+//! The plugin stores no secret of its own. Where a vendor ships a CLI that
+//! already owns the browser flow, the credential on disk, and refresh — `ant`
+//! for Anthropic, `gcloud` for Google — the broker delegates to it and asks for
+//! a short-lived credential only when a request is about to go out. OpenRouter
+//! ships no CLI, so its broker reads a key the user placed in the environment or
+//! in the config directory; it still writes nothing.
 //!
-//! The two vendors want that credential presented differently, so a broker
-//! returns a typed [`Credential`] rather than a bare string: sending an API key
-//! as a bearer token (or the reverse) fails in ways that look like a bad key.
+//! The vendors want that credential presented differently, so a broker returns a
+//! typed [`Credential`] rather than a bare string: sending an API key as a
+//! bearer token (or the reverse) fails in ways that look like a bad key.
 
 pub mod ant;
 pub mod google;
+pub mod openrouter;
 pub mod proc;
 
 /// A credential plus how it must be presented on the wire.

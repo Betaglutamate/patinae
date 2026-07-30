@@ -312,7 +312,7 @@ Plugins are compiled as dynamic libraries (`.dylib` on macOS, `.so` on Linux,
 | **raytracer** | `raytracer-plugin` | GPU ray tracing with BVH acceleration, shadows, transparency, and edge detection |
 | **ipc** | `ipc-plugin` | Inter-process communication plugin for external tool integration |
 | **python** | `python-plugin` | Embedded CPython interpreter for scripting inside the native app |
-| **ai** | `ai-plugin` | AI agent (Claude or Gemini) that drives the viewer from natural language |
+| **ai** | `ai-plugin` | AI agent (Claude, Gemini, or any OpenRouter model) that drives the viewer from natural language |
 
 Build and stage the reference plugins:
 
@@ -348,26 +348,62 @@ ai load 1crn and show it as cartoon coloured by chain
 ai what chains are in this structure and how long are they?
 ```
 
-The provider is selected with `set ai_provider, claude`. The plugin is
-provider-neutral above the wire layer, but Claude is the only backend
-implemented so far — selecting `gemini` reports that rather than falling back.
+#### Choosing a provider and model
 
-Sign-in is brokered through Anthropic's [`ant` CLI](https://platform.claude.com/docs/en/api/sdks/cli),
-which owns the OAuth flow and token refresh — the plugin stores no credential
-of its own. Install `ant`, then use **Sign in** in the panel.
+Three providers are supported: **Claude** via Anthropic's Messages API,
+**Gemini** via the Google Developer API, and **OpenRouter**, which fronts models
+from every vendor behind one key.
+
+The panel's model bar is the easiest route — provider, model, and reasoning
+effort as three dropdowns directly above the prompt. It writes the same settings
+the command line does, so either can be used:
+
+```text
+set ai_provider, openrouter
+set openrouter_model, google/gemini-3-pro
+set ai_effort, high
+```
+
+The model list is fetched from whichever provider is active and cached for a day
+under `~/.patinae/`, so the picker is populated instantly and still works
+offline. Only models that can call tools are offered — an agent that cannot call
+tools cannot drive the viewer — and each is shown with its capabilities, context
+window, and price. Recently used models are pinned to the top, and the filter box
+appears once the catalogue is large enough to need it. A model missing from the
+catalogue can still be set by hand.
+
+Switching provider or model drops the reasoning blocks in the conversation so
+far, because a thinking signature is only valid for the model that produced it.
+The transcript says so when it happens.
+
+#### Signing in
+
+The plugin stores no credential of its own.
+
+| Provider | Credential |
+| --- | --- |
+| Claude | [`ant` CLI](https://platform.claude.com/docs/en/api/sdks/cli) — owns the OAuth flow and token refresh. Install it, then use **Sign in** in the panel. |
+| Gemini | `gcloud auth application-default login`, or a `GEMINI_API_KEY` from [AI Studio](https://aistudio.google.com/apikey). |
+| OpenRouter | `OPENROUTER_API_KEY`, or a key from [openrouter.ai/keys](https://openrouter.ai/keys) saved to `~/.patinae/openrouter.key`. |
+
+#### Approval
 
 Tool calls that change the scene require approval before they run. Set
-`claude_auto_approve, on` to skip the prompt for commands; Python always
-prompts, because it executes in the viewer's own process.
+`ai_auto_approve, on` to skip the prompt for commands; Python always prompts,
+because it executes in the viewer's own process.
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
-| `claude_model` | `claude-opus-5` | Model to use |
-| `claude_effort` | `xhigh` | Reasoning effort: `low`…`max` |
-| `claude_max_tokens` | `64000` | Response cap |
-| `claude_auto_approve` | `off` | Run scene commands without prompting |
-| `claude_allow_python` | `on` | Offer the Python tool at all |
-| `claude_capture_width` / `_height` | `1024` / `768` | Screenshot size |
+| `ai_provider` | `claude` | `claude`, `gemini`, or `openrouter` |
+| `claude_model` | `claude-sonnet-5` | Model used on Claude |
+| `gemini_model` | `gemini-2.5-pro` | Model used on Gemini |
+| `openrouter_model` | `anthropic/claude-sonnet-5` | Model used on OpenRouter |
+| `ai_effort` | `medium` | Reasoning effort: `low`…`max` |
+| `ai_max_tokens` | `64000` | Response cap |
+| `ai_auto_approve` | `off` | Run scene commands without prompting |
+| `ai_allow_python` | `on` | Offer the Python tool at all |
+| `ai_capture_width` / `_height` | `1024` / `768` | Screenshot size |
+| `ai_recent_models` | — | Models pinned to the top of the picker; written by the panel |
 
 ## License
 

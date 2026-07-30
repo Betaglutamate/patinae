@@ -7,8 +7,14 @@
 //! through the user's `~/.patinae/patinaerc`.
 //!
 //! Naming: settings that apply to whichever provider is active are `ai_*`; the
-//! model is per-provider (`claude_model`, `gemini_model`) because the defaults
-//! are vendor-specific and users switch back and forth.
+//! model is per-provider (`claude_model`, `gemini_model`, `openrouter_model`)
+//! because the defaults are vendor-specific, the names share no namespace, and
+//! users switch back and forth — one global `ai_model` would be overwritten on
+//! every switch.
+//!
+//! These settings are also the *only* record of which provider and model are
+//! active. The panel's dropdowns write here rather than into plugin state, so
+//! the picker and `set ai_provider` cannot disagree.
 
 use patinae_plugin::define_plugin_settings;
 use patinae_plugin::prelude::*;
@@ -19,12 +25,20 @@ use crate::provider::ProviderId;
 pub const PROVIDER: &str = "ai_provider";
 pub const CLAUDE_MODEL: &str = "claude_model";
 pub const GEMINI_MODEL: &str = "gemini_model";
+pub const OPENROUTER_MODEL: &str = "openrouter_model";
+pub const RECENT_MODELS: &str = "ai_recent_models";
 pub const EFFORT: &str = "ai_effort";
 pub const MAX_TOKENS: &str = "ai_max_tokens";
 pub const AUTO_APPROVE: &str = "ai_auto_approve";
 pub const ALLOW_PYTHON: &str = "ai_allow_python";
 pub const CAPTURE_WIDTH: &str = "ai_capture_width";
 pub const CAPTURE_HEIGHT: &str = "ai_capture_height";
+
+/// How many models the picker pins to the top before the full list.
+///
+/// Small on purpose: the value of a recents list is that the models you use are
+/// reachable without reading, and a long one is just the catalogue again.
+pub const MAX_RECENT_MODELS: usize = 5;
 
 pub const DEFAULT_EFFORT: &str = "medium";
 pub const DEFAULT_MAX_TOKENS: i32 = 64_000;
@@ -60,19 +74,26 @@ pub fn string_descriptors() -> Vec<DynamicSettingDescriptor> {
         object_overridable: false,
     };
 
+    let provider_hints: Vec<&str> = ProviderId::ALL.iter().map(|p| p.as_str()).collect();
+
     vec![
-        hinted(
-            PROVIDER,
-            ProviderId::Claude.as_str(),
-            &[ProviderId::Claude.as_str(), ProviderId::Gemini.as_str()],
-        ),
+        hinted(PROVIDER, ProviderId::Claude.as_str(), &provider_hints),
         hinted(CLAUDE_MODEL, ProviderId::Claude.default_model(), &[]),
         hinted(GEMINI_MODEL, ProviderId::Gemini.default_model(), &[]),
+        hinted(
+            OPENROUTER_MODEL,
+            ProviderId::OpenRouter.default_model(),
+            &[],
+        ),
         hinted(
             EFFORT,
             DEFAULT_EFFORT,
             &["low", "medium", "high", "xhigh", "max"],
         ),
+        // Written by the panel rather than typed, but registered like any other
+        // setting so it persists through `patinaerc` and can be cleared with
+        // `unset` when the list stops being useful.
+        hinted(RECENT_MODELS, "", &[]),
     ]
 }
 
@@ -93,13 +114,51 @@ pub fn provider(shared: &SharedContext<'_>) -> ProviderId {
     ProviderId::parse(&raw).unwrap_or(ProviderId::Claude)
 }
 
-/// Model for the given provider.
-pub fn model(shared: &SharedContext<'_>, id: ProviderId) -> String {
-    let key = match id {
+/// Name of the model setting belonging to `id`.
+pub fn model_setting(id: ProviderId) -> &'static str {
+    match id {
         ProviderId::Claude => CLAUDE_MODEL,
         ProviderId::Gemini => GEMINI_MODEL,
-    };
-    setting_string(shared, key, id.default_model())
+        ProviderId::OpenRouter => OPENROUTER_MODEL,
+    }
+}
+
+/// Model for the given provider.
+pub fn model(shared: &SharedContext<'_>, id: ProviderId) -> String {
+    setting_string(shared, model_setting(id), id.default_model())
+}
+
+/// Recently selected models, most recent first.
+///
+/// Stored as one comma-separated string because the settings registry has no
+/// list type, and a list of model ids never contains a comma.
+pub fn recent_models(shared: &SharedContext<'_>) -> Vec<String> {
+    setting_string(shared, RECENT_MODELS, "")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Move `model` to the front of the recents list, capped at
+/// [`MAX_RECENT_MODELS`].
+///
+/// Pure so the ordering rules are testable without a settings registry.
+pub fn promote_recent(existing: &[String], model: &str) -> Vec<String> {
+    let model = model.trim();
+    if model.is_empty() {
+        return existing.to_vec();
+    }
+    let mut out = vec![model.to_string()];
+    out.extend(
+        existing
+            .iter()
+            .filter(|m| m.as_str() != model)
+            .take(MAX_RECENT_MODELS - 1)
+            .cloned(),
+    );
+    out
 }
 
 /// Effort level, applied to whichever provider is active.
@@ -166,12 +225,69 @@ mod tests {
 
     #[test]
     fn provider_setting_hints_every_known_provider() {
+        // Derived from ProviderId::ALL, so a provider added without a hint is
+        // impossible rather than merely undiscoverable.
         let hints: Vec<String> = descriptor(PROVIDER)
             .value_hints
             .into_iter()
             .map(|(k, _)| k)
             .collect();
-        assert_eq!(hints, ["claude", "gemini"]);
+        let expected: Vec<&str> = ProviderId::ALL.iter().map(|p| p.as_str()).collect();
+        assert_eq!(hints, expected);
+        assert_eq!(hints, ["claude", "gemini", "openrouter"]);
+    }
+
+    #[test]
+    fn every_provider_has_a_distinct_model_setting_registered() {
+        let names: Vec<String> = string_descriptors().into_iter().map(|d| d.name).collect();
+        for id in ProviderId::ALL {
+            let key = model_setting(id);
+            assert!(
+                names.contains(&key.to_string()),
+                "{key} is not registered, so `set {key}` would fail"
+            );
+            assert_eq!(
+                descriptor(key).default,
+                SettingValue::String(id.default_model().into())
+            );
+        }
+        // Two providers sharing one model setting would silently overwrite
+        // each other on every switch.
+        let keys: Vec<&str> = ProviderId::ALL
+            .iter()
+            .map(|id| model_setting(*id))
+            .collect();
+        for (i, a) in keys.iter().enumerate() {
+            assert!(
+                !keys[i + 1..].contains(a),
+                "{a} is shared between providers"
+            );
+        }
+    }
+
+    #[test]
+    fn a_chosen_model_moves_to_the_front_of_the_recents_list() {
+        let existing = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(promote_recent(&existing, "c"), ["c", "a", "b"]);
+    }
+
+    #[test]
+    fn reselecting_a_recent_model_promotes_it_without_duplicating_it() {
+        let existing = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(promote_recent(&existing, "c"), ["c", "a", "b"]);
+    }
+
+    #[test]
+    fn the_recents_list_is_capped() {
+        let existing: Vec<String> = (0..20).map(|i| format!("m{i}")).collect();
+        assert_eq!(promote_recent(&existing, "new").len(), MAX_RECENT_MODELS);
+        assert_eq!(promote_recent(&existing, "new")[0], "new");
+    }
+
+    #[test]
+    fn a_blank_model_never_enters_the_recents_list() {
+        let existing = vec!["a".to_string()];
+        assert_eq!(promote_recent(&existing, "   "), existing);
     }
 
     #[test]

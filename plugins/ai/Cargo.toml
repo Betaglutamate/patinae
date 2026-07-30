@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
-description = "Patinae AI plugin: an in-viewer agent (Claude or Gemini) that drives the scene"
+description = "Patinae AI plugin: an in-viewer agent (Claude, Gemini, or OpenRouter) that drives the scene"
 
 [lib]
 # rlib alongside cdylib so the agent loop, SSE parser, and tool schemas stay
