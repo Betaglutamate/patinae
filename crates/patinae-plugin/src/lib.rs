@@ -51,10 +51,11 @@ pub mod prelude {
     pub use patinae_framework::component::SharedContext;
     pub use patinae_framework::message::{AppMessage, MessageBus};
     pub use patinae_framework::plugin_ui::{
-        PanelAction, PanelButton, PanelColumn, PanelControl, PanelControlNode, PanelDescriptor,
-        PanelEvent, PanelEventKind, PanelGroup, PanelOption, PanelPlacement, PanelRow,
-        PanelRuntimeRequirements, PanelSnapshot, PanelTextArea, PanelTextHighlight, PanelTextStyle,
-        PanelValue, PluginPanel,
+        PanelAction, PanelButton, PanelColumn, PanelComposer, PanelControl, PanelControlNode,
+        PanelDescriptor, PanelEvent, PanelEventKind, PanelGroup, PanelMessage, PanelMessageBlock,
+        PanelMessageRole, PanelMessageStatus, PanelNotice, PanelNoticeTone, PanelOption,
+        PanelPlacement, PanelRow, PanelRuntimeRequirements, PanelSnapshot, PanelTextArea,
+        PanelTextHighlight, PanelTextStyle, PanelTranscript, PanelValue, PluginPanel,
     };
     pub use patinae_framework::topics::{
         custom_action, publish, subscribe, SaveFileRequest, SAVE_FILE_REQUEST_TOPIC,
