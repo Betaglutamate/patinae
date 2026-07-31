@@ -29,6 +29,7 @@
 pub mod auth;
 pub mod catalogue;
 pub mod handler;
+pub mod markdown;
 pub mod panel;
 pub mod prompt;
 pub mod provider;

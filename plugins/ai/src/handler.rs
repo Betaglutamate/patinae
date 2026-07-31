@@ -23,7 +23,7 @@ use serde_json::Value;
 use crate::prompt;
 use crate::provider::Part;
 use crate::settings;
-use crate::state::{Entry, Pending, Shared};
+use crate::state::{Entry, Pending, Shared, ToolStatus};
 use crate::tools;
 use crate::worker::{FromWorker, ToWorker, WorkerHandle};
 
@@ -76,6 +76,25 @@ impl ClaudeHandler {
     fn note(&self, text: impl Into<String>) {
         if let Ok(mut s) = self.state.lock() {
             s.push(Entry::Note(text.into()));
+        }
+    }
+
+    /// Record a tool call as a transcript row, pending its outcome.
+    fn note_tool(&self, call_id: &str, name: &str, command: &str, status: ToolStatus) {
+        if let Ok(mut s) = self.state.lock() {
+            s.push(Entry::Tool {
+                call_id: call_id.to_string(),
+                name: name.to_string(),
+                command: command.to_string(),
+                status,
+            });
+        }
+    }
+
+    /// Mark a tool row with how it turned out.
+    fn resolve_tool(&self, call_id: &str, outcome: ToolStatus) {
+        if let Ok(mut s) = self.state.lock() {
+            s.resolve_tool(call_id, outcome);
         }
     }
 
@@ -225,10 +244,15 @@ impl ClaudeHandler {
         };
 
         if allow {
-            self.note(format!("{} → {}", gate.name, gate.command));
+            self.note_tool(
+                &gate.call_id,
+                &gate.name,
+                &gate.command,
+                ToolStatus::Running,
+            );
             self.run_command_tool(ctx, &gate.call_id, &gate.name, &gate.command);
         } else {
-            self.note(format!("Denied: {}", gate.command));
+            self.note_tool(&gate.call_id, &gate.name, &gate.command, ToolStatus::Denied);
             // An explicit error result lets Claude adapt; silently dropping the
             // call would strand the turn waiting forever.
             self.reply_text(
@@ -343,7 +367,7 @@ impl ClaudeHandler {
 
             let auto = ctx.shared.setting_bool(settings::AUTO_APPROVE, false);
             if auto && !executes_code {
-                self.note(format!("{name} → {command}"));
+                self.note_tool(call_id, name, &command, ToolStatus::Running);
                 self.run_command_tool(ctx, call_id, name, &command);
             } else {
                 self.gated.push_back(Gated {
@@ -510,9 +534,13 @@ impl ClaudeHandler {
             };
             match &result.result {
                 Ok(()) => {
+                    self.resolve_tool(&call_id, ToolStatus::Ok);
                     self.reply_text(&call_id, &name, "Command completed successfully.", false)
                 }
-                Err(e) => self.reply_text(&call_id, &name, format!("Command failed: {e}"), true),
+                Err(e) => {
+                    self.resolve_tool(&call_id, ToolStatus::Failed);
+                    self.reply_text(&call_id, &name, format!("Command failed: {e}"), true)
+                }
             }
         }
     }

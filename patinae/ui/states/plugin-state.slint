@@ -115,6 +115,28 @@ export struct PluginPanelTab {
     active: bool,
 }
 
+// ── Conversational controls ───────────────────────────────────────────
+// One span of a message body. `kind` is "code" or "prose"; code carries the
+// fence's info string as `language` and gets its own monospace surface.
+export struct PluginMessageBlock {
+    kind: string,
+    language: string,
+    text: string,
+}
+
+// One entry in a transcript. `id` is stable across snapshots so the bridge can
+// reuse rows instead of rebuilding the whole list on every streamed token.
+export struct PluginMessage {
+    id: string,
+    // "user" | "assistant" | "tool" | "error"
+    role: string,
+    author: string,
+    // "" | "running" | "ok" | "denied" | "failed" — tool rows only.
+    status: string,
+    detail: string,
+    blocks: [PluginMessageBlock],
+}
+
 export struct PluginControl {
     id: string,
     kind: string,
@@ -140,6 +162,14 @@ export struct PluginControl {
     image-value: image,
     image-width: float,
     image-height: float,
+    // Absorbs the panel's leftover height rather than declaring a fixed one.
+    stretch: float,
+    // Transcript rows, and whether to show the working indicator at the tail.
+    messages: [PluginMessage],
+    busy: bool,
+    // Composer keyboard hint / notice tone ("info" | "warn" | "danger").
+    hint: string,
+    tone: string,
 }
 
 export global PluginState {
@@ -154,6 +184,11 @@ export global PluginState {
     in-out property <string> active-bottom-title;
     in-out property <bool> right-visible: false;
     in-out property <bool> bottom-visible: false;
+    // Whether the active panel lays out to full height instead of scrolling as
+    // a whole. Computed in Rust — folding over a model inside Slint is awkward,
+    // and the snapshot already knows the answer.
+    in-out property <bool> right-fills: false;
+    in-out property <bool> bottom-fills: false;
 
     callback toggle-panel(string);
     callback activate-panel(string);

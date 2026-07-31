@@ -11,7 +11,8 @@ use patinae_framework::plugin_ui::{PanelEvent, PanelPlacement};
 use patinae_plugin_host::PanelFrame;
 
 use crate::{
-    AppWindow, LayoutState, PluginControl, PluginPanelTab, PluginState, PluginToolbarItem,
+    AppWindow, LayoutState, PluginControl, PluginMessage, PluginMessageBlock, PluginPanelTab,
+    PluginState, PluginToolbarItem,
 };
 
 use controls::to_slint_control;
@@ -114,6 +115,9 @@ impl PluginBridge {
             &self.bottom_tab_signature,
             tabs_signature,
         );
+
+        ps.set_right_fills(active_right.is_some_and(|frame| frame.snapshot.fills()));
+        ps.set_bottom_fills(active_bottom.is_some_and(|frame| frame.snapshot.fills()));
 
         if let Some(frame) = active_right {
             ps.set_active_right_panel_id(frame.status.descriptor.id.clone().into());
@@ -290,6 +294,12 @@ fn reconcile_control_row(existing: &PluginControl, mut next: PluginControl) -> P
             next.children = existing.children.clone();
         }
     }
+    if is_stable_transcript(existing, &next) {
+        let rows = collect_model_rows(&next.messages);
+        if reconcile_message_rows(&existing.messages, rows) {
+            next.messages = existing.messages.clone();
+        }
+    }
     next
 }
 
@@ -297,6 +307,53 @@ fn is_stable_container(existing: &PluginControl, next: &PluginControl) -> bool {
     existing.id == next.id
         && existing.kind == next.kind
         && matches!(next.kind.as_str(), "row" | "column" | "group")
+}
+
+fn is_stable_transcript(existing: &PluginControl, next: &PluginControl) -> bool {
+    existing.id == next.id && existing.kind == next.kind && next.kind == "transcript"
+}
+
+/// Update a transcript's message model in place, touching only rows that
+/// actually changed.
+///
+/// Streaming pushes a snapshot per token, and every row this writes is a row
+/// the `ListView` re-lays out. Since a delta only ever grows the last message,
+/// skipping the untouched rows keeps the cost of a long conversation flat
+/// instead of quadratic — and leaves the view's scroll position alone.
+fn reconcile_message_rows(model: &ModelRc<PluginMessage>, rows: Vec<PluginMessage>) -> bool {
+    let Some(vec_model) = model.as_any().downcast_ref::<VecModel<PluginMessage>>() else {
+        return false;
+    };
+    while vec_model.row_count() > rows.len() {
+        vec_model.remove(vec_model.row_count() - 1);
+    }
+    for (idx, row) in rows.into_iter().enumerate() {
+        match vec_model.row_data(idx) {
+            Some(existing) if same_message(&existing, &row) => {}
+            Some(_) => vec_model.set_row_data(idx, row),
+            None => vec_model.push(row),
+        }
+    }
+    true
+}
+
+fn same_message(a: &PluginMessage, b: &PluginMessage) -> bool {
+    a.id == b.id
+        && a.role == b.role
+        && a.author == b.author
+        && a.status == b.status
+        && a.detail == b.detail
+        && same_blocks(&a.blocks, &b.blocks)
+}
+
+fn same_blocks(a: &ModelRc<PluginMessageBlock>, b: &ModelRc<PluginMessageBlock>) -> bool {
+    if a.row_count() != b.row_count() {
+        return false;
+    }
+    (0..a.row_count()).all(|idx| match (a.row_data(idx), b.row_data(idx)) {
+        (Some(x), Some(y)) => x.kind == y.kind && x.language == y.language && x.text == y.text,
+        _ => false,
+    })
 }
 
 fn reconcile_node_rows(
@@ -391,8 +448,9 @@ fn tabs_signature(rows: &[PluginPanelTab]) -> Vec<String> {
 mod tests {
     use super::*;
     use patinae_framework::plugin_ui::{
-        PanelColumn, PanelControl as CoreControl, PanelControlNode as CoreControlNode, PanelRow,
-        PanelTextArea, PanelTextHighlight, PanelTextStyle,
+        PanelColumn, PanelControl as CoreControl, PanelControlNode as CoreControlNode,
+        PanelMessage as CoreMessage, PanelMessageRole as CoreMessageRole, PanelRow, PanelSnapshot,
+        PanelTextArea, PanelTextHighlight, PanelTextStyle, PanelTranscript,
     };
     use slint::Model;
 
@@ -465,5 +523,93 @@ mod tests {
         replace_control_model(&model, vec![row_control("other", "gamma")]);
         let changed_id_children = model.row_data(0).unwrap().children;
         assert_ne!(changed_id_children, changed_kind_children);
+    }
+
+    // --- transcripts -------------------------------------------------------
+
+    fn transcript(id: &str, bodies: &[(&str, &str)]) -> PluginControl {
+        let messages = bodies
+            .iter()
+            .map(|(mid, body)| CoreMessage::text(*mid, CoreMessageRole::Assistant, "Claude", *body))
+            .collect();
+        to_slint_control(&CoreControl::Transcript(PanelTranscript::new(id, messages)))
+    }
+
+    fn body_of(model: &Rc<VecModel<PluginControl>>, idx: usize) -> String {
+        model
+            .row_data(0)
+            .unwrap()
+            .messages
+            .row_data(idx)
+            .unwrap()
+            .blocks
+            .row_data(0)
+            .unwrap()
+            .text
+            .to_string()
+    }
+
+    #[test]
+    fn a_stable_transcript_reuses_its_message_model() {
+        // Streaming pushes a snapshot per token. Rebuilding the model each time
+        // would reset the transcript's scroll position mid-reply.
+        let model = Rc::new(VecModel::default());
+        replace_control_model(&model, vec![transcript("log", &[("m1", "Loa")])]);
+        let original = model.row_data(0).unwrap().messages;
+
+        replace_control_model(&model, vec![transcript("log", &[("m1", "Loading 1crn")])]);
+        assert_eq!(model.row_data(0).unwrap().messages, original);
+        assert_eq!(body_of(&model, 0), "Loading 1crn");
+    }
+
+    #[test]
+    fn a_streamed_delta_leaves_the_settled_messages_untouched() {
+        // Only the tail grows, so only the tail should be written back — every
+        // row this touches is a row the view re-lays out.
+        let model = Rc::new(VecModel::default());
+        replace_control_model(
+            &model,
+            vec![transcript("log", &[("m1", "done"), ("m2", "wri")])],
+        );
+        let settled = model.row_data(0).unwrap().messages.row_data(0).unwrap();
+
+        replace_control_model(
+            &model,
+            vec![transcript("log", &[("m1", "done"), ("m2", "writing")])],
+        );
+        let after = model.row_data(0).unwrap().messages.row_data(0).unwrap();
+
+        // The untouched row keeps the very block model it already had.
+        assert_eq!(after.blocks, settled.blocks);
+        assert_eq!(body_of(&model, 1), "writing");
+    }
+
+    #[test]
+    fn a_shorter_transcript_drops_the_rows_it_no_longer_has() {
+        let model = Rc::new(VecModel::default());
+        replace_control_model(
+            &model,
+            vec![transcript("log", &[("m1", "a"), ("m2", "b"), ("m3", "c")])],
+        );
+        assert_eq!(model.row_data(0).unwrap().messages.row_count(), 3);
+
+        // Clearing the conversation must not leave ghosts behind.
+        replace_control_model(&model, vec![transcript("log", &[])]);
+        assert_eq!(model.row_data(0).unwrap().messages.row_count(), 0);
+    }
+
+    #[test]
+    fn a_transcript_reports_that_its_panel_fills() {
+        let chat = PanelSnapshot::new(vec![CoreControl::Transcript(PanelTranscript::new(
+            "log",
+            Vec::new(),
+        ))]);
+        assert!(chat.fills());
+        assert_eq!(to_slint_control(&chat.controls[0]).stretch, 1.0);
+
+        // Existing form panels must keep scrolling as a whole.
+        let form = PanelSnapshot::new(vec![text_area("print")]);
+        assert!(!form.fills());
+        assert_eq!(to_slint_control(&form.controls[0]).stretch, 0.0);
     }
 }

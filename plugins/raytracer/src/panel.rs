@@ -688,6 +688,12 @@ mod tests {
             | PanelControl::TitleDesc { id, .. }
             | PanelControl::Spacer { id, .. } => ids.push(id.clone()),
             PanelControl::TextArea(area) => ids.push(area.id.clone()),
+            // The conversational controls. This panel does not use them, but
+            // the match stays exhaustive so a new control cannot be added
+            // without someone deciding what it means here.
+            PanelControl::Transcript(t) => ids.push(t.id.clone()),
+            PanelControl::Composer(c) => ids.push(c.id.clone()),
+            PanelControl::Notice(n) => ids.push(n.id.clone()),
             PanelControl::Row(row) => {
                 ids.push(row.id.clone());
                 for child in &row.children {
@@ -771,7 +777,10 @@ mod tests {
             | PanelControl::Spacer { id, .. }
             | PanelControl::Row(PanelRow { id, .. })
             | PanelControl::Column(PanelColumn { id, .. })
-            | PanelControl::Group(PanelGroup { id, .. }) => Some(id),
+            | PanelControl::Group(PanelGroup { id, .. })
+            | PanelControl::Transcript(PanelTranscript { id, .. })
+            | PanelControl::Composer(PanelComposer { id, .. })
+            | PanelControl::Notice(PanelNotice { id, .. }) => Some(id),
             PanelControl::TextArea(area) => Some(area.id.as_str()),
         }
     }

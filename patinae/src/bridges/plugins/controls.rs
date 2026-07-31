@@ -4,12 +4,13 @@ use slint::{Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel};
 
 use patinae_framework::plugin_ui::{
     PanelButton as CoreButton, PanelControl as CoreControl, PanelControlNode as CoreControlNode,
-    PanelOption as CoreOption,
+    PanelMessage as CoreMessage, PanelMessageBlock as CoreBlock, PanelMessageRole as CoreRole,
+    PanelMessageStatus as CoreStatus, PanelNoticeTone as CoreTone, PanelOption as CoreOption,
 };
 
 use crate::{
-    PluginButtonItem, PluginControl, PluginControlLeaf, PluginControlNode, PluginOption,
-    PluginSubLeaf,
+    PluginButtonItem, PluginControl, PluginControlLeaf, PluginControlNode, PluginMessage,
+    PluginMessageBlock, PluginOption, PluginSubLeaf,
 };
 
 use super::text_highlights::{empty_highlight_lines_model, highlight_lines_model};
@@ -161,8 +162,100 @@ pub(crate) fn to_slint_control(control: &CoreControl) -> PluginControl {
             row.kind = "spacer".into();
             row.num_value = *height;
         }
+        CoreControl::Transcript(transcript) => {
+            row.id = transcript.id.clone().into();
+            row.kind = "transcript".into();
+            row.text = transcript.placeholder.clone().into();
+            row.busy = transcript.busy;
+            row.messages = messages_model(&transcript.messages);
+            // The one control that takes what is left rather than asking for a
+            // fixed height, so the composer beneath it stays on screen.
+            row.stretch = 1.0;
+        }
+        CoreControl::Composer(composer) => {
+            row.id = composer.id.clone().into();
+            row.kind = "composer".into();
+            row.value_text = composer.value.clone().into();
+            row.text = composer.placeholder.clone().into();
+            row.hint = composer.hint.clone().into();
+            row.rows = composer.max_rows as f32;
+            // The send action leads; the rest follow in the same row.
+            let mut buttons = vec![composer.send.clone()];
+            buttons.extend(composer.secondary.iter().cloned());
+            row.buttons = button_items_model(&buttons);
+        }
+        CoreControl::Notice(notice) => {
+            row.id = notice.id.clone().into();
+            row.kind = "notice".into();
+            row.label = notice.title.clone().into();
+            row.text = notice.body.clone().into();
+            row.read_only = notice.code;
+            row.tone = tone_name(notice.tone).into();
+            row.buttons = button_items_model(&notice.buttons);
+        }
     }
     row
+}
+
+fn role_name(role: CoreRole) -> &'static str {
+    match role {
+        CoreRole::User => "user",
+        CoreRole::Assistant => "assistant",
+        CoreRole::Tool => "tool",
+        CoreRole::Error => "error",
+    }
+}
+
+fn status_name(status: CoreStatus) -> &'static str {
+    match status {
+        CoreStatus::None => "",
+        CoreStatus::Running => "running",
+        CoreStatus::Ok => "ok",
+        CoreStatus::Denied => "denied",
+        CoreStatus::Failed => "failed",
+    }
+}
+
+fn tone_name(tone: CoreTone) -> &'static str {
+    match tone {
+        CoreTone::Info => "info",
+        CoreTone::Warn => "warn",
+        CoreTone::Danger => "danger",
+    }
+}
+
+fn messages_model(messages: &[CoreMessage]) -> ModelRc<PluginMessage> {
+    let rows: Vec<PluginMessage> = messages
+        .iter()
+        .map(|message| PluginMessage {
+            id: message.id.clone().into(),
+            role: role_name(message.role).into(),
+            author: message.author.clone().into(),
+            status: status_name(message.status).into(),
+            detail: message.detail.clone().into(),
+            blocks: blocks_model(&message.blocks),
+        })
+        .collect();
+    ModelRc::from(Rc::new(VecModel::from(rows)))
+}
+
+fn blocks_model(blocks: &[CoreBlock]) -> ModelRc<PluginMessageBlock> {
+    let rows: Vec<PluginMessageBlock> = blocks
+        .iter()
+        .map(|block| match block {
+            CoreBlock::Prose(text) => PluginMessageBlock {
+                kind: "prose".into(),
+                language: Default::default(),
+                text: text.clone().into(),
+            },
+            CoreBlock::Code { language, text } => PluginMessageBlock {
+                kind: "code".into(),
+                language: language.clone().into(),
+                text: text.clone().into(),
+            },
+        })
+        .collect();
+    ModelRc::from(Rc::new(VecModel::from(rows)))
 }
 
 fn empty_control() -> PluginControl {
@@ -191,6 +284,11 @@ fn empty_control() -> PluginControl {
         image_value: Image::default(),
         image_width: 0.0,
         image_height: 0.0,
+        stretch: 0.0,
+        messages: ModelRc::from(Rc::new(VecModel::default())),
+        busy: false,
+        hint: "".into(),
+        tone: "".into(),
     }
 }
 
@@ -353,6 +451,24 @@ fn control_height(control: &CoreControl) -> f32 {
         CoreControl::Number { .. } | CoreControl::TextInput { .. } => 46.0,
         CoreControl::Select { .. } => 52.0,
         CoreControl::TextArea(area) => (area.rows as f32 * 18.0 + 22.0).max(72.0),
+        // A transcript stretches, so this is only the floor it will not shrink
+        // below — enough to keep a couple of messages visible in a squeezed dock.
+        CoreControl::Transcript(_) => 96.0,
+        // The box grows with what is typed, so the reported height is the tall
+        // case: `max_rows` of text, the action row, and the keyboard hint.
+        CoreControl::Composer(composer) => {
+            let hint = if composer.hint.is_empty() { 0.0 } else { 14.0 };
+            composer.max_rows as f32 * 17.0 + 26.0 + hint
+        }
+        CoreControl::Notice(notice) => {
+            let body = if notice.body.is_empty() {
+                0.0
+            } else {
+                wrapped_height(&notice.body, 17.0)
+            };
+            let buttons = if notice.buttons.is_empty() { 0.0 } else { 30.0 };
+            (24.0 + body + buttons + 16.0).max(44.0)
+        }
         CoreControl::Image { height, .. } => *height as f32,
         CoreControl::Spacer { height, .. } => (*height).max(4.0),
         CoreControl::Row(layout) => layout
@@ -406,6 +522,20 @@ fn rgba_to_image(rgba: &[u8], w: u32, h: u32) -> Image {
     }
     let buf = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(rgba, w, h);
     Image::from_rgba8(buf)
+}
+
+/// Rough height for wrapped text, from its line count and a wrap estimate.
+///
+/// The real width is not known until layout, so this assumes a narrow dock
+/// column and rounds up. It only sets the row's reported height; the rendered
+/// text wraps for itself either way.
+fn wrapped_height(text: &str, line_height: f32) -> f32 {
+    const CHARS_PER_LINE: usize = 44;
+    let lines: usize = text
+        .lines()
+        .map(|line| line.chars().count().div_ceil(CHARS_PER_LINE).max(1))
+        .sum();
+    lines.max(1) as f32 * line_height
 }
 
 fn format_number(v: f32) -> String {
