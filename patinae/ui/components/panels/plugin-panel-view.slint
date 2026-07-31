@@ -1,6 +1,6 @@
 import { Theme } from "../../theme.slint";
 import { Tokens } from "../../tokens.slint";
-import { PluginState, PluginControl, PluginControlNode, PluginControlLeaf, PluginSubLeaf, PluginOption, PluginButtonItem, PluginHighlightLine } from "../../states/plugin-state.slint";
+import { PluginState, PluginControl, PluginControlNode, PluginControlLeaf, PluginSubLeaf, PluginOption, PluginButtonItem, PluginHighlightLine, PluginMessage, PluginMessageBlock } from "../../states/plugin-state.slint";
 import { HighlightedTextArea } from "highlighted-text-area.slint";
 
 component PluginButton inherits Rectangle {
@@ -1544,12 +1544,432 @@ component PluginGroup inherits Rectangle {
     }
 }
 
-component PluginControlRow inherits Rectangle {
+// =============================================================================
+// Conversational controls
+// =============================================================================
+
+// A labelled pill. The icon buttons above show their label only as a tooltip,
+// which is wrong for the composer's primary action — "Send" has to be readable
+// without hovering it first.
+component PluginPillButton inherits Rectangle {
+    in property <PluginButtonItem> button;
+    in property <string> panel-id;
+
+    height: 24px;
+    width: max(52px, pill-label.preferred-width + 2 * Tokens.space-md);
+    border-radius: Tokens.radius-sm;
+    background: root.button.primary
+        ? (root.button.enabled ? Theme.cyan.with-alpha(0.18) : transparent)
+        : pill-touch.has-hover && root.button.enabled ? Theme.bg-inset : transparent;
+    border-width: Tokens.hairline;
+    border-color: root.button.primary && root.button.enabled
+        ? Theme.cyan.with-alpha(0.60)
+        : pill-touch.has-hover && root.button.enabled ? Theme.line-strong : Theme.line;
+    opacity: root.button.enabled ? 1.0 : 0.35;
+
+    animate background, border-color { duration: Tokens.motion-micro; }
+
+    pill-label := Text {
+        width: 100%;
+        height: 100%;
+        text: root.button.label;
+        color: root.button.primary ? Theme.cyan : Theme.text-dim;
+        font-size: Tokens.font-md;
+        font-weight: 500;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    pill-touch := TouchArea {
+        enabled: root.button.enabled;
+        mouse-cursor: pointer;
+        clicked => {
+            PluginState.control-event(root.panel-id, root.button.id, "click", "", 0, false);
+        }
+    }
+}
+
+// One span of a message body: prose, or code on its own inset surface.
+component PluginMessageBody inherits VerticalLayout {
+    in property <[PluginMessageBlock]> blocks;
+    in property <color> tint: Theme.text;
+    in property <length> size: Tokens.font-lg;
+
+    spacing: Tokens.space-sm;
+
+    for block in root.blocks: Rectangle {
+        // Code earns its own surface so a command the agent means to run reads
+        // as a command and not as a sentence that happens to contain one.
+        background: block.kind == "code" ? Theme.bg-inset.with-alpha(0.75) : transparent;
+        border-radius: block.kind == "code" ? Tokens.radius-sm : 0;
+        border-width: block.kind == "code" ? Tokens.hairline : 0;
+        border-color: Theme.line;
+        height: block-text.preferred-height + (block.kind == "code" ? 2 * Tokens.space-sm : 0);
+
+        block-text := Text {
+            x: block.kind == "code" ? Tokens.space-sm : 0;
+            y: block.kind == "code" ? Tokens.space-sm : 0;
+            width: parent.width - 2 * self.x;
+            text: block.text;
+            color: block.kind == "code" ? Theme.text-dim : root.tint;
+            // Matching the script editor's face means agent code and your own
+            // code look like the same kind of thing.
+            font-family: block.kind == "code" ? "JetBrains Mono" : "";
+            font-size: block.kind == "code" ? Tokens.font-md : root.size;
+            wrap: word-wrap;
+        }
+    }
+}
+
+// One entry in the transcript. Each role gets its own treatment: what the user
+// said is a card, what the agent said is just text, and what the agent *did* is
+// a compact auditable row.
+component PluginTranscriptRow inherits Rectangle {
+    in property <PluginMessage> message;
+
+    property <bool> is-tool: root.message.role == "tool";
+    // Only the two roles that need calling out get a rule: what you asked for,
+    // and what went wrong.
+    property <bool> ruled: root.message.role == "user" || root.message.role == "error";
+    property <color> rule: root.message.role == "error" ? Theme.error : Theme.cyan;
+
+    height: body-column.preferred-height;
+
+    // Left accent rule — carries the role without spending a whole line on it.
+    if root.ruled: Rectangle {
+        x: 0;
+        width: 2px;
+        height: parent.height;
+        background: root.rule;
+        border-radius: 1px;
+    }
+
+    Rectangle {
+        x: root.ruled ? Tokens.space-sm : 0;
+        width: parent.width - self.x;
+        height: parent.height;
+        background: root.message.role == "user" ? Theme.bg-raised.with-alpha(0.55)
+            : root.message.role == "error" ? Theme.bg-card.with-alpha(0.70)
+            : transparent;
+        border-radius: root.message.role == "assistant" || root.is-tool ? 0 : Tokens.radius-md;
+
+        body-column := VerticalLayout {
+            padding: root.message.role == "assistant" || root.is-tool ? 0 : Tokens.space-sm;
+            spacing: Tokens.space-xs;
+
+            // A tool row is a single line: status, name, command. The whole
+            // point is to skim a run of them and see what touched the scene.
+            if root.is-tool: HorizontalLayout {
+                spacing: Tokens.space-sm;
+
+                Text {
+                    width: 12px;
+                    text: root.message.status == "ok" ? "✓"
+                        : root.message.status == "denied" ? "⊘"
+                        : root.message.status == "failed" ? "✕"
+                        : "▸";
+                    color: root.message.status == "ok" ? Theme.good
+                        : root.message.status == "denied" ? Theme.warning
+                        : root.message.status == "failed" ? Theme.error
+                        : Theme.text-faint;
+                    font-size: Tokens.font-md;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    text: root.message.author;
+                    color: Theme.text-muted;
+                    font-family: "JetBrains Mono";
+                    font-size: Tokens.font-sm;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    horizontal-stretch: 1;
+                    text: root.message.detail;
+                    color: Theme.text-faint;
+                    font-family: "JetBrains Mono";
+                    font-size: Tokens.font-sm;
+                    overflow: elide;
+                    vertical-alignment: center;
+                }
+            }
+
+            // Speaker label. Omitted for the user's own card — the accent rule
+            // and the indent already say whose words these are.
+            if !root.is-tool && root.message.role != "user": Text {
+                text: root.message.author;
+                color: root.message.role == "error" ? Theme.error : Theme.text-muted;
+                font-size: Tokens.font-sm;
+                font-weight: 600;
+                letter-spacing: 0.4px;
+            }
+
+            if !root.is-tool: PluginMessageBody {
+                blocks: root.message.blocks;
+                tint: root.message.role == "error" ? Theme.error : Theme.text;
+            }
+        }
+    }
+}
+
+component PluginTranscript inherits Rectangle {
     in property <PluginControl> control;
     in property <string> panel-id;
 
-    height: control.kind == "text" ? max(root.control.height * 1px, text-row.preferred-height)
+    // Most negative scroll offset — where the newest message sits.
+    property <length> bottom-y: min(0px, flick.height - flick.viewport-height);
+    // Whether to keep following new output. Dropped as soon as the user scrolls
+    // up: yanking someone back to the bottom while they're reading is worse
+    // than not following at all.
+    property <bool> follow: true;
+
+    background: transparent;
+    clip: true;
+
+    changed bottom-y => {
+        if (root.follow) {
+            flick.viewport-y = root.bottom-y;
+        }
+    }
+
+    flick := Flickable {
+        width: 100%;
+        height: 100%;
+        viewport-height: stack.preferred-height;
+        viewport-width: self.width;
+
+        // Only fires on user scrolling, so it never fights the pin above.
+        flicked => {
+            root.follow = self.viewport-y <= root.bottom-y + 12px;
+        }
+
+        stack := VerticalLayout {
+            width: flick.width;
+            padding: Tokens.space-sm;
+            spacing: Tokens.space-md;
+            alignment: start;
+
+            for message in root.control.messages: PluginTranscriptRow {
+                width: flick.width - 2 * Tokens.space-sm;
+                message: message;
+            }
+
+            // Three dots that breathe while a turn is in flight. A tool loop
+            // can run for many seconds with nothing else to show for it, and
+            // silence reads as a hang.
+            if root.control.busy: HorizontalLayout {
+                height: 16px;
+                spacing: Tokens.space-xs;
+                alignment: start;
+
+                for dot[i] in [0, 1, 2]: Rectangle {
+                    y: (parent.height - self.height) / 2;
+                    width: 4px;
+                    height: 4px;
+                    border-radius: 2px;
+                    background: Theme.cyan;
+                    opacity: root.control.busy ? 0.95 : 0.2;
+
+                    animate opacity {
+                        duration: 700ms;
+                        delay: i * 160ms;
+                        iteration-count: -1;
+                        direction: alternate;
+                        easing: ease-in-out;
+                    }
+                }
+            }
+        }
+    }
+
+    // Empty state. The examples matter more here than anywhere else in the
+    // panel: an agent with no visible capabilities is an agent nobody tries.
+    if root.control.messages.length == 0 && root.control.text != "": Text {
+        x: Tokens.space-md;
+        y: Tokens.space-md;
+        width: parent.width - 2 * Tokens.space-md;
+        text: root.control.text;
+        color: Theme.text-faint;
+        font-size: Tokens.font-md;
+        wrap: word-wrap;
+    }
+}
+
+component PluginComposer inherits Rectangle {
+    in property <PluginControl> control;
+    in property <string> panel-id;
+
+    property <length> line-height: max(Tokens.font-lg * 1.35, 17px);
+    property <bool> editor-focused: false;
+    property <string> draft: root.control.value-text;
+
+    height: frame.height + (root.control.hint == "" ? 0px : 14px);
+    background: transparent;
+
+    // The host rebuilds this snapshot on every streamed token. Without this
+    // guard each rebuild would stomp the caret of whoever is mid-sentence, so
+    // an incoming reply must not overwrite a box someone is typing in.
+    changed control => {
+        if (!root.editor-focused) {
+            root.draft = root.control.value-text;
+        }
+    }
+
+    frame := Rectangle {
+        y: 0;
+        width: 100%;
+        height: max(32px, min(root.control.rows, 1 + floor(editor.preferred-height / root.line-height)) * root.line-height + 14px);
+        border-radius: Tokens.radius-md;
+        background: Theme.bg-inset.with-alpha(0.70);
+        border-width: Tokens.hairline;
+        border-color: root.editor-focused ? Theme.cyan.with-alpha(0.65) : Theme.line;
+
+        animate border-color { duration: Tokens.motion-micro; }
+
+        HorizontalLayout {
+            padding: Tokens.space-sm;
+            spacing: Tokens.space-sm;
+
+            Rectangle {
+                horizontal-stretch: 1;
+                clip: true;
+
+                editor := TextInput {
+                    width: 100%;
+                    text: root.draft;
+                    single-line: false;
+                    wrap: word-wrap;
+                    color: Theme.text;
+                    font-size: Tokens.font-lg;
+                    selection-background-color: Theme.cyan.with-alpha(0.3);
+                    selection-foreground-color: Theme.text;
+
+                    // Enter sends, Shift+Enter breaks the line. Reversing these
+                    // is the single most common way a chat box annoys people.
+                    key-pressed(event) => {
+                        if (event.text == "\n" && !event.modifiers.shift) {
+                            PluginState.control-event(root.panel-id, root.control.id, "text-commit", self.text, 0, false);
+                            return accept;
+                        }
+                        return reject;
+                    }
+
+                    edited => {
+                        root.draft = self.text;
+                        PluginState.control-event(root.panel-id, root.control.id, "text-edit", self.text, 0, false);
+                    }
+
+                    changed has-focus => {
+                        root.editor-focused = self.has-focus;
+                    }
+                }
+
+                if root.draft == "" && root.control.text != "": Text {
+                    width: 100%;
+                    text: root.control.text;
+                    color: Theme.text-ghost;
+                    font-size: Tokens.font-lg;
+                }
+            }
+
+            // Actions live inside the frame: the text and the act of sending it
+            // are one object, so the box can never be on screen without them.
+            VerticalLayout {
+                alignment: end;
+
+                HorizontalLayout {
+                    spacing: Tokens.space-xs;
+
+                    for button in root.control.buttons: PluginPillButton {
+                        button: button;
+                        panel-id: root.panel-id;
+                    }
+                }
+            }
+        }
+    }
+
+    if root.control.hint != "": Text {
+        y: frame.height + 2px;
+        x: Tokens.space-xs;
+        text: root.control.hint;
+        color: Theme.text-ghost;
+        font-size: Tokens.font-sm;
+    }
+}
+
+component PluginNotice inherits Rectangle {
+    in property <PluginControl> control;
+    in property <string> panel-id;
+
+    property <color> accent:
+        root.control.tone == "danger" ? Theme.error
+        : root.control.tone == "warn" ? Theme.warning
+        : Theme.cyan;
+
+    border-radius: Tokens.radius-md;
+    background: root.accent.with-alpha(0.07);
+    border-width: Tokens.hairline;
+    border-color: root.accent.with-alpha(0.45);
+
+    Rectangle {
+        x: 0;
+        width: 2px;
+        height: parent.height;
+        background: root.accent;
+    }
+
+    VerticalLayout {
+        padding: Tokens.space-sm;
+        padding-left: Tokens.space-md;
+        spacing: Tokens.space-xs;
+
+        Text {
+            text: root.control.label;
+            color: root.accent;
+            font-size: Tokens.font-md;
+            font-weight: 600;
+        }
+
+        // Monospace when the body is something that would run. Deciding whether
+        // to approve a command means reading it exactly.
+        if root.control.text != "": Text {
+            text: root.control.text;
+            color: Theme.text-dim;
+            font-family: root.control.read-only ? "JetBrains Mono" : "";
+            font-size: root.control.read-only ? Tokens.font-md : Tokens.font-sm;
+            wrap: word-wrap;
+        }
+
+        if root.control.buttons.length > 0: HorizontalLayout {
+            height: 24px;
+            spacing: Tokens.space-xs;
+            alignment: end;
+
+            for button in root.control.buttons: PluginPillButton {
+                button: button;
+                panel-id: root.panel-id;
+            }
+        }
+    }
+}
+
+component PluginControlRow inherits Rectangle {
+    in property <PluginControl> control;
+    in property <string> panel-id;
+    // Set by a filling panel for the control that absorbs leftover height.
+    in property <bool> stretchy: false;
+
+    // Expressed as constraints rather than as a plain `height` binding: an
+    // explicit height would pin the row to exactly that size, and a transcript
+    // has to be free to grow into whatever the dock has left.
+    property <length> natural: control.kind == "text"
+        ? max(root.control.height * 1px, text-row.preferred-height)
         : max(4px, root.control.height * 1px);
+
+    min-height: root.natural;
+    max-height: root.stretchy ? 1000000px : root.natural;
 
     if control.kind == "heading": Text {
         width: 100%;
@@ -1692,16 +2112,55 @@ component PluginControlRow inherits Rectangle {
         source: root.control.image-value;
         image-fit: contain;
     }
+
+    if control.kind == "transcript": PluginTranscript {
+        width: 100%;
+        height: 100%;
+        control: root.control;
+        panel-id: root.panel-id;
+    }
+
+    if control.kind == "composer": PluginComposer {
+        width: 100%;
+        control: root.control;
+        panel-id: root.panel-id;
+    }
+
+    if control.kind == "notice": PluginNotice {
+        width: 100%;
+        height: 100%;
+        control: root.control;
+        panel-id: root.panel-id;
+    }
 }
 
 export component PluginPanelView inherits Rectangle {
     in property <string> panel-id;
     in property <[PluginControl]> controls;
+    // Set when one of the controls absorbs leftover height. A form scrolls as a
+    // whole; a conversation fills the dock and scrolls inside its transcript,
+    // which is what keeps the composer on screen.
+    in property <bool> fills: false;
 
     background: Theme.bg-panel;
     clip: true;
 
-    Flickable {
+    if root.fills: VerticalLayout {
+        width: 100%;
+        height: 100%;
+        padding: 10px;
+        spacing: 8px;
+
+        for control in root.controls: PluginControlRow {
+            width: 100%;
+            vertical-stretch: control.stretch;
+            stretchy: control.stretch > 0;
+            control: control;
+            panel-id: root.panel-id;
+        }
+    }
+
+    if !root.fills: Flickable {
         width: 100%;
         height: 100%;
 

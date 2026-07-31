@@ -200,6 +200,263 @@ impl PanelTextArea {
     }
 }
 
+// =============================================================================
+// Conversational controls
+// =============================================================================
+//
+// A chat is not a stack of form fields. These three describe one — a scrolling
+// log of authored messages, a composer that stays put beneath it, and a card
+// for the moments the user has to answer something. They render at the top
+// level of a panel only, which is why none of them appear in the nested
+// `PanelControlNode` vocabulary: a transcript inside a table cell is not a
+// layout anyone wants.
+
+/// Who authored a transcript message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PanelMessageRole {
+    User,
+    Assistant,
+    /// Something the agent *did* rather than said — a tool call, rendered as an
+    /// auditable row rather than as prose.
+    Tool,
+    Error,
+}
+
+/// How a message's action turned out.
+///
+/// Only meaningful for [`PanelMessageRole::Tool`]; everything else is
+/// [`PanelMessageStatus::None`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PanelMessageStatus {
+    None,
+    Running,
+    Ok,
+    Denied,
+    Failed,
+}
+
+/// One span of a message body.
+///
+/// Bodies arrive as markdown-ish text; the plugin splits them so the renderer
+/// never has to parse anything. Code earns different treatment from prose —
+/// monospace, its own surface — and that is the distinction worth carrying.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PanelMessageBlock {
+    Prose(String),
+    Code { language: String, text: String },
+}
+
+impl PanelMessageBlock {
+    pub fn prose(text: impl Into<String>) -> Self {
+        Self::Prose(text.into())
+    }
+
+    pub fn code(language: impl Into<String>, text: impl Into<String>) -> Self {
+        Self::Code {
+            language: language.into(),
+            text: text.into(),
+        }
+    }
+
+    /// The block's text, whichever kind it is.
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Prose(text) => text,
+            Self::Code { text, .. } => text,
+        }
+    }
+}
+
+/// One authored entry in a transcript.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PanelMessage {
+    /// Stable across snapshots, so the renderer can reuse the row it already
+    /// built instead of rebuilding the list on every streamed token.
+    pub id: String,
+    pub role: PanelMessageRole,
+    /// Display name of the speaker — "You", "Claude", "Gemini".
+    pub author: String,
+    pub blocks: Vec<PanelMessageBlock>,
+    pub status: PanelMessageStatus,
+    /// Secondary text: the command for a tool row, the model for a reply.
+    pub detail: String,
+}
+
+impl PanelMessage {
+    pub fn new(
+        id: impl Into<String>,
+        role: PanelMessageRole,
+        author: impl Into<String>,
+        blocks: Vec<PanelMessageBlock>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            role,
+            author: author.into(),
+            blocks,
+            status: PanelMessageStatus::None,
+            detail: String::new(),
+        }
+    }
+
+    /// A message whose body is a single run of prose.
+    pub fn text(
+        id: impl Into<String>,
+        role: PanelMessageRole,
+        author: impl Into<String>,
+        body: impl Into<String>,
+    ) -> Self {
+        Self::new(id, role, author, vec![PanelMessageBlock::prose(body)])
+    }
+
+    pub fn status(mut self, status: PanelMessageStatus) -> Self {
+        self.status = status;
+        self
+    }
+
+    pub fn detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = detail.into();
+        self
+    }
+}
+
+/// A scrolling conversation log.
+///
+/// Stretches to fill whatever height the panel has left, and scrolls inside
+/// itself — which is what keeps the composer beneath it on screen instead of
+/// pushed below the fold.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PanelTranscript {
+    pub id: String,
+    pub messages: Vec<PanelMessage>,
+    /// Shown in place of the messages while the transcript is empty.
+    pub placeholder: String,
+    /// Whether to show a working indicator at the tail. A long tool loop with
+    /// no visible sign of life is indistinguishable from a hang.
+    pub busy: bool,
+}
+
+impl PanelTranscript {
+    pub fn new(id: impl Into<String>, messages: Vec<PanelMessage>) -> Self {
+        Self {
+            id: id.into(),
+            messages,
+            placeholder: String::new(),
+            busy: false,
+        }
+    }
+
+    pub fn placeholder(mut self, placeholder: impl Into<String>) -> Self {
+        self.placeholder = placeholder.into();
+        self
+    }
+
+    pub fn busy(mut self, busy: bool) -> Self {
+        self.busy = busy;
+        self
+    }
+}
+
+/// A multi-line prompt box with its actions attached.
+///
+/// The send button lives inside the frame rather than in a separate row: the
+/// text and the act of sending it are one object, and pairing them means the
+/// composer cannot be on screen while its button is not.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PanelComposer {
+    pub id: String,
+    pub value: String,
+    pub placeholder: String,
+    /// Lines to grow to before the box starts scrolling instead.
+    pub max_rows: u32,
+    /// The primary action, rendered inside the frame.
+    pub send: PanelButton,
+    /// Buttons rendered alongside it — stop, clear.
+    pub secondary: Vec<PanelButton>,
+    /// Keyboard hint shown under the box, e.g. "⏎ send · ⇧⏎ newline".
+    pub hint: String,
+}
+
+impl PanelComposer {
+    pub fn new(id: impl Into<String>, value: impl Into<String>, send: PanelButton) -> Self {
+        Self {
+            id: id.into(),
+            value: value.into(),
+            placeholder: String::new(),
+            max_rows: 6,
+            send,
+            secondary: Vec::new(),
+            hint: String::new(),
+        }
+    }
+
+    pub fn placeholder(mut self, placeholder: impl Into<String>) -> Self {
+        self.placeholder = placeholder.into();
+        self
+    }
+
+    pub fn max_rows(mut self, rows: u32) -> Self {
+        self.max_rows = rows.max(1);
+        self
+    }
+
+    pub fn secondary(mut self, buttons: Vec<PanelButton>) -> Self {
+        self.secondary = buttons;
+        self
+    }
+
+    pub fn hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = hint.into();
+        self
+    }
+}
+
+/// How loudly a notice presents itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PanelNoticeTone {
+    Info,
+    Warn,
+    Danger,
+}
+
+/// An accent-ruled card asking for attention, and usually for an answer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PanelNotice {
+    pub id: String,
+    pub tone: PanelNoticeTone,
+    pub title: String,
+    pub body: String,
+    /// Render the body monospaced. Approval prompts show the exact command that
+    /// would run, and a proportional font is the wrong typeface for deciding
+    /// whether to run something.
+    pub code: bool,
+    pub buttons: Vec<PanelButton>,
+}
+
+impl PanelNotice {
+    pub fn new(id: impl Into<String>, tone: PanelNoticeTone, title: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            tone,
+            title: title.into(),
+            body: String::new(),
+            code: false,
+            buttons: Vec::new(),
+        }
+    }
+
+    pub fn body(mut self, body: impl Into<String>, code: bool) -> Self {
+        self.body = body.into();
+        self.code = code;
+        self
+    }
+
+    pub fn buttons(mut self, buttons: Vec<PanelButton>) -> Self {
+        self.buttons = buttons;
+        self
+    }
+}
+
 /// A child control inside a generic panel layout container.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PanelControlNode {
@@ -366,6 +623,12 @@ pub enum PanelControl {
         placeholder: String,
     },
     TextArea(PanelTextArea),
+    /// A scrolling conversation log. Absorbs the panel's leftover height.
+    Transcript(PanelTranscript),
+    /// A multi-line prompt box with its send action inside the frame.
+    Composer(PanelComposer),
+    /// An accent-ruled card asking for attention.
+    Notice(PanelNotice),
     Row(PanelRow),
     Column(PanelColumn),
     Group(PanelGroup),
@@ -381,6 +644,18 @@ pub enum PanelControl {
     },
 }
 
+impl PanelControl {
+    /// Whether this control absorbs the panel's leftover vertical space.
+    ///
+    /// Every other control declares a fixed height and the panel scrolls as a
+    /// whole. A transcript instead takes what is left and scrolls internally,
+    /// which is the difference between a composer that stays put and one that
+    /// slides off the bottom of the dock.
+    pub fn stretches(&self) -> bool {
+        matches!(self, Self::Transcript(_))
+    }
+}
+
 /// A complete render snapshot for one panel.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PanelSnapshot {
@@ -390,6 +665,15 @@ pub struct PanelSnapshot {
 impl PanelSnapshot {
     pub fn new(controls: Vec<PanelControl>) -> Self {
         Self { controls }
+    }
+
+    /// Whether the panel lays out to its full height instead of scrolling.
+    ///
+    /// True as soon as one control stretches. The frontend uses this to choose
+    /// between a scrolling stack and a filled layout, so panels that predate
+    /// the conversational controls keep their existing behaviour untouched.
+    pub fn fills(&self) -> bool {
+        self.controls.iter().any(PanelControl::stretches)
     }
 }
 
@@ -520,7 +804,75 @@ pub trait PluginPanel: Send {
 
 #[cfg(test)]
 mod tests {
-    use super::PanelEventKind;
+    use super::*;
+
+    fn transcript() -> PanelControl {
+        PanelControl::Transcript(PanelTranscript::new(
+            "log",
+            vec![PanelMessage::text("m1", PanelMessageRole::User, "You", "hi")],
+        ))
+    }
+
+    #[test]
+    fn only_a_transcript_absorbs_leftover_height() {
+        assert!(transcript().stretches());
+        assert!(!PanelControl::Text {
+            id: "t".into(),
+            text: "x".into(),
+        }
+        .stretches());
+        assert!(!PanelControl::TextArea(PanelTextArea::new(
+            "a", "", "", "", 4, false
+        ))
+        .stretches());
+    }
+
+    #[test]
+    fn a_panel_fills_exactly_when_one_of_its_controls_stretches() {
+        // Panels that predate the conversational controls must keep scrolling
+        // as a whole, so this has to stay false for all of them.
+        let form = PanelSnapshot::new(vec![PanelControl::Text {
+            id: "t".into(),
+            text: "x".into(),
+        }]);
+        assert!(!form.fills());
+        assert!(!PanelSnapshot::default().fills());
+
+        let chat = PanelSnapshot::new(vec![
+            transcript(),
+            PanelControl::Composer(PanelComposer::new(
+                "c",
+                "",
+                PanelButton::new("send", "Send", "", true),
+            )),
+        ]);
+        assert!(chat.fills());
+    }
+
+    #[test]
+    fn a_message_block_yields_its_text_whichever_kind_it_is() {
+        assert_eq!(PanelMessageBlock::prose("hello").text(), "hello");
+        assert_eq!(PanelMessageBlock::code("python", "cmd.zoom()").text(), "cmd.zoom()");
+    }
+
+    #[test]
+    fn messages_default_to_no_status_and_carry_one_when_given() {
+        let plain = PanelMessage::text("m", PanelMessageRole::Assistant, "Claude", "hi");
+        assert_eq!(plain.status, PanelMessageStatus::None);
+
+        let tool = PanelMessage::text("t", PanelMessageRole::Tool, "run_command", "")
+            .status(PanelMessageStatus::Running)
+            .detail("load 1crn");
+        assert_eq!(tool.status, PanelMessageStatus::Running);
+        assert_eq!(tool.detail, "load 1crn");
+    }
+
+    #[test]
+    fn a_composer_always_has_at_least_one_row_to_type_into() {
+        let composer = PanelComposer::new("c", "", PanelButton::new("send", "Send", "", true))
+            .max_rows(0);
+        assert_eq!(composer.max_rows, 1);
+    }
 
     #[test]
     fn text_edit_is_the_only_non_refreshing_panel_event() {
