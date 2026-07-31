@@ -286,14 +286,18 @@ fn build_snapshot(state: &SharedState, selection: &Selection) -> PanelSnapshot {
     //    Absent entirely in auto-approve mode, so the panel stays quiet.
     if let Some(pending) = &state.pending {
         controls.push(PanelControl::Notice(
-            PanelNotice::new(APPROVAL, PanelNoticeTone::Warn, format!("Run {}?", pending.name))
-                // Verbatim and monospaced: approving a command means reading
-                // exactly the command that will run.
-                .body(pending.payload.clone(), true)
-                .buttons(vec![
-                    PanelButton::new(DENY, "Deny", "", false),
-                    PanelButton::new(ALLOW, "Allow", "", true),
-                ]),
+            PanelNotice::new(
+                APPROVAL,
+                PanelNoticeTone::Warn,
+                format!("Run {}?", pending.name),
+            )
+            // Verbatim and monospaced: approving a command means reading
+            // exactly the command that will run.
+            .body(pending.payload.clone(), true)
+            .buttons(vec![
+                PanelButton::new(DENY, "Deny", "", false),
+                PanelButton::new(ALLOW, "Allow", "", true),
+            ]),
         ));
     }
 
@@ -391,7 +395,9 @@ fn settings_group(
 
     if let Some(mut line) = capability_line(state, selection, shown) {
         if !capable {
-            line.push_str("   — this model cannot call tools, so the agent cannot drive the viewer.");
+            line.push_str(
+                "   — this model cannot call tools, so the agent cannot drive the viewer.",
+            );
         }
         children.push(PanelControlNode::new(PanelControl::Text {
             id: CAPABILITIES.into(),
@@ -671,11 +677,7 @@ mod tests {
     }
 
     fn ids(snapshot: &PanelSnapshot) -> Vec<String> {
-        snapshot
-            .controls
-            .iter()
-            .map(control_id)
-            .collect()
+        snapshot.controls.iter().map(control_id).collect()
     }
 
     fn control_id(control: &PanelControl) -> String {
@@ -764,7 +766,10 @@ mod tests {
         let gated = snapshot_of(&state_with(|s| s.pending = Some(gate())));
         let order = ids(&gated);
         let approval = order.iter().position(|id| id == APPROVAL).expect("notice");
-        let composer = order.iter().position(|id| id == COMPOSER).expect("composer");
+        let composer = order
+            .iter()
+            .position(|id| id == COMPOSER)
+            .expect("composer");
         assert!(approval < composer);
     }
 
@@ -826,9 +831,7 @@ mod tests {
                     assert!(
                         !matches!(
                             child.control,
-                            PanelControl::Group(_)
-                                | PanelControl::Row(_)
-                                | PanelControl::Column(_)
+                            PanelControl::Group(_) | PanelControl::Row(_) | PanelControl::Column(_)
                         ),
                         "the settings group nests too deeply to render"
                     );
@@ -1027,9 +1030,9 @@ mod tests {
     fn the_model_select_gets_its_own_line_rather_than_a_third_of_a_row() {
         // `anthropic/claude-sonnet-5` does not fit in a third of a 280px dock.
         let snapshot = snapshot_of(&state_with(|s| s.settings_open = true));
-        let model_is_top_level = settings_children(&snapshot).iter().any(|c| {
-            matches!(c, PanelControl::Select { id, .. } if id == MODEL_SELECT)
-        });
+        let model_is_top_level = settings_children(&snapshot)
+            .iter()
+            .any(|c| matches!(c, PanelControl::Select { id, .. } if id == MODEL_SELECT));
         assert!(model_is_top_level);
     }
 
@@ -1300,7 +1303,11 @@ mod tests {
             })
             .expect("model row");
 
-        let ids: Vec<String> = row.children.iter().map(|n| control_id(&n.control)).collect();
+        let ids: Vec<String> = row
+            .children
+            .iter()
+            .map(|n| control_id(&n.control))
+            .collect();
         assert_eq!(ids, [PROVIDER_SELECT, EFFORT_SELECT]);
     }
 }

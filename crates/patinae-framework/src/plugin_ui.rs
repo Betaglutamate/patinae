@@ -809,7 +809,12 @@ mod tests {
     fn transcript() -> PanelControl {
         PanelControl::Transcript(PanelTranscript::new(
             "log",
-            vec![PanelMessage::text("m1", PanelMessageRole::User, "You", "hi")],
+            vec![PanelMessage::text(
+                "m1",
+                PanelMessageRole::User,
+                "You",
+                "hi",
+            )],
         ))
     }
 
@@ -821,10 +826,7 @@ mod tests {
             text: "x".into(),
         }
         .stretches());
-        assert!(!PanelControl::TextArea(PanelTextArea::new(
-            "a", "", "", "", 4, false
-        ))
-        .stretches());
+        assert!(!PanelControl::TextArea(PanelTextArea::new("a", "", "", "", 4, false)).stretches());
     }
 
     #[test]
@@ -852,7 +854,10 @@ mod tests {
     #[test]
     fn a_message_block_yields_its_text_whichever_kind_it_is() {
         assert_eq!(PanelMessageBlock::prose("hello").text(), "hello");
-        assert_eq!(PanelMessageBlock::code("python", "cmd.zoom()").text(), "cmd.zoom()");
+        assert_eq!(
+            PanelMessageBlock::code("python", "cmd.zoom()").text(),
+            "cmd.zoom()"
+        );
     }
 
     #[test]
@@ -869,8 +874,8 @@ mod tests {
 
     #[test]
     fn a_composer_always_has_at_least_one_row_to_type_into() {
-        let composer = PanelComposer::new("c", "", PanelButton::new("send", "Send", "", true))
-            .max_rows(0);
+        let composer =
+            PanelComposer::new("c", "", PanelButton::new("send", "Send", "", true)).max_rows(0);
         assert_eq!(composer.max_rows, 1);
     }
 

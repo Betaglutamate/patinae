@@ -99,9 +99,7 @@ mod tests {
             .into_iter()
             .map(|block| match block {
                 PanelMessageBlock::Prose(text) => ("prose".to_string(), text),
-                PanelMessageBlock::Code { language, text } => {
-                    (format!("code:{language}"), text)
-                }
+                PanelMessageBlock::Code { language, text } => (format!("code:{language}"), text),
             })
             .collect()
     }

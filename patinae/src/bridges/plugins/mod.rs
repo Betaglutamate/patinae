@@ -530,9 +530,7 @@ mod tests {
     fn transcript(id: &str, bodies: &[(&str, &str)]) -> PluginControl {
         let messages = bodies
             .iter()
-            .map(|(mid, body)| {
-                CoreMessage::text(*mid, CoreMessageRole::Assistant, "Claude", *body)
-            })
+            .map(|(mid, body)| CoreMessage::text(*mid, CoreMessageRole::Assistant, "Claude", *body))
             .collect();
         to_slint_control(&CoreControl::Transcript(PanelTranscript::new(id, messages)))
     }
