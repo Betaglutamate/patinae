@@ -1750,8 +1750,9 @@ component PluginTranscript inherits Rectangle {
             spacing: Tokens.space-md;
             alignment: start;
 
+            // Width comes from the layout's own padding, not from a second
+            // calculation of it.
             for message in root.control.messages: PluginTranscriptRow {
-                width: flick.width - 2 * Tokens.space-sm;
                 message: message;
             }
 
@@ -1819,7 +1820,8 @@ component PluginComposer inherits Rectangle {
     frame := Rectangle {
         y: 0;
         width: 100%;
-        height: max(32px, min(root.control.rows, 1 + floor(editor.preferred-height / root.line-height)) * root.line-height + 14px);
+        // Grows with what is typed, up to `rows` lines, then the editor scrolls.
+        height: clamp(probe.preferred-height, root.line-height, root.control.rows * root.line-height) + 14px;
         border-radius: Tokens.radius-md;
         background: Theme.bg-inset.with-alpha(0.70);
         border-width: Tokens.hairline;
@@ -1834,6 +1836,21 @@ component PluginComposer inherits Rectangle {
             Rectangle {
                 horizontal-stretch: 1;
                 clip: true;
+
+                // Measures the draft at the editor's own width. The frame's
+                // height is taken from this rather than from the `TextInput`,
+                // whose own height the layout is busy assigning — a `Text` has
+                // an intrinsic preferred height that depends only on its width
+                // and its content, so there is no way for the two to chase each
+                // other. `highlighted-text-area.slint` measures the same way.
+                probe := Text {
+                    x: -100000px;
+                    width: parent.width;
+                    text: root.draft == "" ? " " : root.draft;
+                    font-size: Tokens.font-lg;
+                    wrap: word-wrap;
+                    opacity: 0;
+                }
 
                 editor := TextInput {
                     width: 100%;
